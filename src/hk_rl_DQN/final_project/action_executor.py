@@ -22,8 +22,8 @@ BRANCH_NAMES = (
     "dream_d",
     "taunt_v",
 )
-BRANCH_SIZES = (3, 2, 2, 2, 2, 2, 2, 2)
-ACTION_PROTOCOL = "branching-key-state-v2-harpoon-silk"
+BRANCH_SIZES = (3, 4, 3, 3, 2, 2, 2, 2)
+ACTION_PROTOCOL = "branching-key-state-v5-executed-fragments"
 BranchMasks = tuple[tuple[bool, ...], ...]
 
 KEYS = {
@@ -106,6 +106,8 @@ def branch_availability(snapshot: Mapping[str, object]) -> tuple[BranchMasks, tu
 
     masks = [[True] * size for size in BRANCH_SIZES]
     reasons: list[str] = []
+    masks[6][1] = False
+    reasons.append("dream_d disabled by policy")
     resources = decode_player_resources(snapshot)
     if not resources.can_harpoon_dash:
         masks[4][1] = False
@@ -129,10 +131,22 @@ def branch_availability(snapshot: Mapping[str, object]) -> tuple[BranchMasks, tu
 
     controls = snapshot.get("player_control")
     control_values = controls if isinstance(controls, Mapping) else {}
-    for branch_index, field in ((1, "jump_available"), (2, "dash_available"), (3, "attack_available")):
-        if control_values.get(field) is False:
-            masks[branch_index][1] = False
-            reasons.append(f"{BRANCH_NAMES[branch_index]} held masked: {field}=false")
+    mobility_controls = (
+        (1, (1, 2), "jump_available", "jump"),
+        (1, (3,), "double_jump_available", "double_jump"),
+        (2, (1,), "dash_available", "dash"),
+        (3, (1, 2), "attack_available", "attack"),
+    )
+    for branch_index, values, field, action_name in mobility_controls:
+        if control_values.get(field) is not True:
+            for value in values:
+                masks[branch_index][value] = False
+            reasons.append(f"{action_name} masked: {field} is false or unavailable")
+    sprint_available = control_values.get("sprint_available") is True
+    sprinting = control_values.get("sprinting") is True
+    if snapshot.get("player_grounded") is not True or not (sprint_available or sprinting):
+        masks[2][2] = False
+        reasons.append("sprint masked: grounded sprint is unavailable")
     return validate_masks(masks), tuple(reasons)
 
 
@@ -143,8 +157,14 @@ def action_keys(action: Sequence[int]) -> tuple[str, ...]:
         keys.append("LeftArrow")
     elif values[0] == 2:
         keys.append("RightArrow")
-    for enabled, key in zip(values[1:], ("Z", "C", "X", "S", "LeftShift", "D", "V")):
-        if enabled:
+    if values[1]:
+        keys.append("Z")
+    if values[2]:
+        keys.append("C")
+    if values[3]:
+        keys.append("X")
+    for enabled, key in zip(values[4:], ("S", "LeftShift", None, "V")):
+        if enabled and key is not None:
             keys.append(key)
     return tuple(keys)
 
@@ -156,11 +176,25 @@ def decode_actions(action: Sequence[int]) -> tuple[str, ...]:
         names.append("left")
     elif values[0] == 2:
         names.append("right")
+    if values[1] == 1:
+        names.append("jump")
+    elif values[1] == 2:
+        names.append("jump_hold")
+    elif values[1] == 3:
+        names.append("double_jump")
+    if values[2] == 1:
+        names.append("dash")
+    elif values[2] == 2:
+        names.append("quick_run")
+    if values[3] == 1:
+        names.append("attack")
+    elif values[3] == 2:
+        names.append("attack_charge")
     for enabled, name in zip(
-        values[1:],
-        ("jump", "dash", "attack", "harpoon_dash", "quick_cast", "dreamnail", "taunt"),
+        values[4:],
+        ("harpoon_dash", "quick_cast", None, "taunt"),
     ):
-        if enabled:
+        if enabled and name is not None:
             names.append(name)
     return tuple(names or ("wait",))
 
@@ -228,6 +262,8 @@ class KeyboardActionExecutor:
     recorder: ActionRecorder
     tick_ms: int = 100
     send_input: bool = False
+    minimum_direction_hold_ms: int = 300
+    minimum_run_hold_ms: int = 300
 
     def __post_init__(self) -> None:
         if self.tick_ms <= 0:
@@ -235,8 +271,14 @@ class KeyboardActionExecutor:
         self._held_keys: set[str] = set()
         self._charge = ChargeState()
         self._attack_hold_ms = 0
+        self._jump_hold_ms = 0
         self._dash_hold_ms = 0
         self._skill_hold_ms = 0
+        self._horizontal_value = 0
+        self._horizontal_hold_ms = 0
+        self._run_hold_ms = 0
+        self._jump_hold_remaining_ms = 0
+        self._jump_mode = "released"
         self._interrupted = False
         if self.send_input:
             focus_game_window()
@@ -244,6 +286,10 @@ class KeyboardActionExecutor:
     def control_state(self, snapshot: Mapping[str, object]) -> KeyHoldState:
         masks, _reasons = branch_availability(snapshot)
         return KeyHoldState(
+            jump_held="Z" in self._held_keys,
+            jump_hold_progress=self._jump_hold_ms / 350.0,
+            jump_available=masks[1][1] or masks[1][2],
+            double_jump_available=masks[1][3],
             attack_held="X" in self._held_keys,
             attack_hold_progress=self._attack_hold_ms / 1350.0,
             dash_held="C" in self._held_keys,
@@ -263,34 +309,98 @@ class KeyboardActionExecutor:
         masked_reasons: Sequence[str] = (),
         player_resources: PlayerResources | None = None,
     ) -> dict[str, object]:
-        values = validate_action(action)
+        attempted = validate_action(action)
         masks = validate_masks(branch_masks) if branch_masks is not None else None
+        illegal_branches: tuple[str, ...] = ()
         if masks is not None:
+            illegal_branches = tuple(
+                BRANCH_NAMES[index]
+                for index, value in enumerate(attempted)
+                if not masks[index][value]
+            )
             values = tuple(
                 value if masks[index][value] else 0
-                for index, value in enumerate(values)
+                for index, value in enumerate(attempted)
             )
+        else:
+            values = attempted
+        values = self._smooth_mobility(values, masks, interrupted)
         desired = set(action_keys(values))
+        pulse_keys: set[str] = set()
+
+        # Jump intents are temporal fragments. A short jump and a double jump
+        # are pulses; a hold jump keeps Z down for a minimum launch window and
+        # can be renewed by selecting the intent on later ticks.
+        if interrupted:
+            self._jump_hold_remaining_ms = 0
+            self._jump_mode = "released"
+        elif values[1] == 1:
+            self._jump_hold_remaining_ms = 0
+            self._jump_mode = "short"
+            pulse_keys.add("Z")
+        elif values[1] == 2:
+            self._jump_hold_remaining_ms = max(self._jump_hold_remaining_ms, 350)
+            self._jump_mode = "hold"
+        elif values[1] == 3:
+            self._jump_hold_remaining_ms = 0
+            self._jump_mode = "double"
+            pulse_keys.add("Z")
+        elif self._jump_hold_remaining_ms > 0:
+            self._jump_mode = "hold"
+        else:
+            self._jump_mode = "released"
+
+        if self._jump_hold_remaining_ms > 0:
+            desired.add("Z")
+            self._jump_hold_remaining_ms = max(0, self._jump_hold_remaining_ms - self.tick_ms)
+
+        # A tap must be a real key pulse even when the policy repeats it on
+        # consecutive ticks. Charge attacks deliberately remain held and are
+        # tracked by ChargeState below.
+        if values[3] == 1:
+            pulse_keys.add("X")
         if interrupted:
             desired.clear()
+        held_before = set(self._held_keys)
         if self.send_input:
+            if values[1] in (1, 3) and "Z" in self._held_keys:
+                _send_key("Z", True)
+                self._held_keys.remove("Z")
+            if "X" in pulse_keys and "X" in self._held_keys:
+                _send_key("X", True)
+                self._held_keys.remove("X")
             for key in sorted(self._held_keys - desired):
                 _send_key(key, True)
             for key in sorted(desired - self._held_keys):
                 _send_key(key, False)
         self._held_keys = desired
         self._interrupted = interrupted
+        self._jump_hold_ms = self._jump_hold_ms + self.tick_ms if "Z" in desired else 0
         self._attack_hold_ms = self._attack_hold_ms + self.tick_ms if "X" in desired else 0
         self._dash_hold_ms = self._dash_hold_ms + self.tick_ms if "C" in desired else 0
         self._skill_hold_ms = self._skill_hold_ms + self.tick_ms if "S" in desired else 0
+        executed_values = list(values)
+        if interrupted:
+            executed_values = [0] * len(BRANCH_SIZES)
+        elif self._jump_mode == "hold" and "Z" in desired and values[1] == 0:
+            executed_values[1] = 2
+        executed = tuple(executed_values)
+        recorded_actions = list(decode_actions(executed))
+        newly_pressed_keys = tuple(sorted(desired - held_before))
         item = self.recorder.record_frame(
-            decode_actions(values),
+            recorded_actions,
             self.tick_ms,
-            note=f"policy vector={list(values)} protocol={ACTION_PROTOCOL}",
+            note=(
+                f"policy vector={list(attempted)} executed={list(values)} "
+                f"protocol={ACTION_PROTOCOL}"
+            ),
             interrupted=interrupted,
             charge=self._charge,
-            action_vector=values,
-            charge_pressed=bool(values[3]),
+            action_vector=executed,
+            attempted_action_vector=attempted,
+            illegal_branches=illegal_branches,
+            newly_pressed_keys=newly_pressed_keys,
+            charge_pressed=values[3] == 2,
             branch_masks=masks,
             masked_reasons=masked_reasons,
             player_resources=(
@@ -299,14 +409,56 @@ class KeyboardActionExecutor:
         )
         return item
 
+    def _smooth_mobility(
+        self,
+        values: tuple[int, ...],
+        masks: BranchMasks | None,
+        interrupted: bool,
+    ) -> tuple[int, ...]:
+        smoothed = list(values)
+        if interrupted:
+            self._horizontal_value = 0
+            self._horizontal_hold_ms = 0
+            self._run_hold_ms = 0
+            return tuple(smoothed)
+
+        requested_horizontal = smoothed[0]
+        if self._horizontal_value == 0:
+            self._horizontal_value = requested_horizontal
+            self._horizontal_hold_ms = self.tick_ms if requested_horizontal else 0
+        elif requested_horizontal == self._horizontal_value:
+            self._horizontal_hold_ms += self.tick_ms
+        elif self._horizontal_hold_ms < self.minimum_direction_hold_ms:
+            smoothed[0] = self._horizontal_value
+            self._horizontal_hold_ms += self.tick_ms
+        else:
+            self._horizontal_value = requested_horizontal
+            self._horizontal_hold_ms = self.tick_ms if requested_horizontal else 0
+
+        run_allowed = masks is None or masks[2][2]
+        if self._run_hold_ms and run_allowed and self._run_hold_ms < self.minimum_run_hold_ms:
+            smoothed[2] = 2
+            self._run_hold_ms += self.tick_ms
+        elif smoothed[2] == 2 and run_allowed:
+            self._run_hold_ms = self._run_hold_ms + self.tick_ms if self._run_hold_ms else self.tick_ms
+        else:
+            self._run_hold_ms = 0
+        return tuple(smoothed)
+
     def release_all(self) -> None:
         if self.send_input:
             for key in sorted(self._held_keys):
                 _send_key(key, True)
         self._held_keys.clear()
         self._attack_hold_ms = 0
+        self._jump_hold_ms = 0
         self._dash_hold_ms = 0
         self._skill_hold_ms = 0
+        self._horizontal_value = 0
+        self._horizontal_hold_ms = 0
+        self._run_hold_ms = 0
+        self._jump_hold_remaining_ms = 0
+        self._jump_mode = "released"
         self._interrupted = True
         self._charge.step(False, self.tick_ms, interrupted=True)
 

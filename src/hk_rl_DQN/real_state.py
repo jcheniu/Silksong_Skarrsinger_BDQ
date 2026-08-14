@@ -46,7 +46,7 @@ BASE_STATE_DIMENSIONS = (
     + len(REACTIONS)
     + len(PHASE_EVENTS)
 )
-CONTROL_STATE_DIMENSIONS = 9
+CONTROL_STATE_DIMENSIONS = 13
 STATE_DIMENSIONS = BASE_STATE_DIMENSIONS + CONTROL_STATE_DIMENSIONS
 
 
@@ -54,6 +54,10 @@ STATE_DIMENSIONS = BASE_STATE_DIMENSIONS + CONTROL_STATE_DIMENSIONS
 class KeyHoldState:
     """Persistent key state required by the Branching-DQN protocol."""
 
+    jump_held: bool = False
+    jump_hold_progress: float = 0.0
+    jump_available: bool = False
+    double_jump_available: bool = False
     attack_held: bool = False
     attack_hold_progress: float = 0.0
     dash_held: bool = False
@@ -66,6 +70,10 @@ class KeyHoldState:
 
     def as_tuple(self) -> tuple[float, ...]:
         return (
+            float(self.jump_held),
+            _clip(self.jump_hold_progress, 0.0, 1.0),
+            float(self.jump_available),
+            float(self.double_jump_available),
             float(self.attack_held),
             _clip(self.attack_hold_progress, 0.0, 1.0),
             float(self.dash_held),

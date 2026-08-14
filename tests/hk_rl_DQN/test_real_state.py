@@ -67,6 +67,10 @@ class RealStateTests(unittest.TestCase):
 
     def test_control_state_is_appended_to_observation(self) -> None:
         controls = KeyHoldState(
+            jump_held=True,
+            jump_hold_progress=0.6,
+            jump_available=True,
+            double_jump_available=True,
             attack_held=True,
             attack_hold_progress=0.5,
             dash_held=True,
@@ -79,6 +83,16 @@ class RealStateTests(unittest.TestCase):
         )
         observation = encode_snapshot(snapshot(), controls).observation
         self.assertEqual(observation[BASE_STATE_DIMENSIONS:], controls.as_tuple())
+
+    def test_jump_control_state_is_part_of_the_observation(self) -> None:
+        controls = KeyHoldState(
+            jump_held=True,
+            jump_hold_progress=0.75,
+            jump_available=False,
+            double_jump_available=True,
+        )
+        values = encode_snapshot(snapshot(), controls).observation[BASE_STATE_DIMENSIONS:]
+        self.assertEqual(values[:4], (1.0, 0.75, 0.0, 1.0))
 
     def test_silk_is_normalized_and_exposed(self) -> None:
         frame = encode_snapshot(snapshot())

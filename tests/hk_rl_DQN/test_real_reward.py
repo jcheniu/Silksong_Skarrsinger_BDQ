@@ -2,10 +2,12 @@ import unittest
 
 from hk_rl_DQN.real_reward import (
     ATTACK_RANGE_REWARD,
-    BOSS_HIT_REWARD,
+    DAMAGE_REWARD_PER_HP,
     DODGE_REWARD,
     PLAYER_HURT_PENALTY,
+    PLAYER_DAMAGE_PENALTY_PER_HP,
     STEP_PENALTY,
+    SILK_SPEND_PENALTY_PER_UNIT,
     VICTORY_REWARD,
     RewardTracker,
 )
@@ -19,6 +21,9 @@ def snapshot(
     boss_x: float = 170.0,
     stun_state: str = "Idle",
     death_state: str = "",
+    boss_damage_events: int | None = None,
+    boss_damage_total: int | None = None,
+    silk: int | None = None,
 ) -> dict[str, object]:
     fsms = [
         {"path": "Boss Scene/Hunter Queen Boss", "name": "Control", "state": state},
@@ -32,7 +37,7 @@ def snapshot(
                 "state": death_state,
             }
         )
-    return {
+    result = {
         "type": "snapshot",
         "timestamp": 1.0,
         "frame": 60,
@@ -43,6 +48,21 @@ def snapshot(
         "boss": {"x": boss_x, "y": 20.0, "velocity_x": 0.0, "velocity_y": 0.0},
         "fsm": fsms,
     }
+    if boss_damage_events is not None:
+        result["boss_damage_events"] = boss_damage_events
+    if boss_damage_total is not None:
+        result["boss_damage_total"] = boss_damage_total
+    if silk is not None:
+        result["player_resources"] = {
+            "silk": silk,
+            "silk_max": 9,
+            "silk_parts": 0,
+            "skill_cost": 4,
+            "silk_abilities_disabled": False,
+            "skill_available": True,
+            "spell_available": True,
+        }
+    return result
 
 
 class RewardTrackerTests(unittest.TestCase):
@@ -62,7 +82,10 @@ class RewardTrackerTests(unittest.TestCase):
         tracker.step(snapshot(health=10))
         reward = tracker.step(snapshot(health=8))
         self.assertEqual(reward.player_health_lost, 2)
-        self.assertEqual(reward.player_hurt, PLAYER_HURT_PENALTY)
+        self.assertEqual(reward.player_damage_taken, 2)
+        self.assertEqual(PLAYER_DAMAGE_PENALTY_PER_HP, -3.0)
+        self.assertEqual(PLAYER_HURT_PENALTY, PLAYER_DAMAGE_PENALTY_PER_HP)
+        self.assertEqual(reward.player_hurt, -6.0)
 
     def test_completed_attack_without_health_loss_rewards_dodge(self) -> None:
         tracker = RewardTracker()
@@ -83,13 +106,45 @@ class RewardTrackerTests(unittest.TestCase):
         reward = tracker.step(snapshot("Movement 1", health=9))
         self.assertEqual(reward.dodge, 0.0)
 
+    def test_attack_without_active_phase_does_not_reward_dodge(self) -> None:
+        tracker = RewardTracker()
+        tracker.step(snapshot("Slash Antic"))
+        reward = tracker.step(snapshot("Movement 1"))
+        self.assertEqual(reward.dodge, 0.0)
+
+    def test_damage_total_scales_reward_proportionally(self) -> None:
+        tracker = RewardTracker()
+        tracker.step(snapshot("Movement 1", boss_damage_total=0))
+        five_damage = tracker.step(snapshot("Cyclone Antic", boss_damage_total=5))
+        self.assertEqual(five_damage.damage_deal, 5)
+        self.assertEqual(DAMAGE_REWARD_PER_HP, 0.05)
+        self.assertEqual(five_damage.damage_reward, 0.25)
+        twenty_damage = tracker.step(snapshot("Cyclone 1", boss_damage_total=25))
+        self.assertEqual(twenty_damage.damage_deal, 20)
+        self.assertEqual(twenty_damage.damage_reward, 1.0)
+
+    def test_damage_counter_reset_is_only_a_baseline(self) -> None:
+        tracker = RewardTracker()
+        tracker.step(snapshot(boss_damage_total=4))
+        reset = tracker.step(snapshot(boss_damage_total=0))
+        self.assertEqual(reset.damage_deal, 0)
+
+    def test_silk_spending_has_a_light_proportional_penalty(self) -> None:
+        tracker = RewardTracker()
+        tracker.step(snapshot(silk=9))
+        reward = tracker.step(snapshot(silk=5))
+        self.assertEqual(reward.silk_spent, 4)
+        self.assertEqual(reward.silk_penalty, 4 * SILK_SPEND_PENALTY_PER_UNIT)
+        self.assertEqual(reward.total, STEP_PENALTY + reward.silk_penalty)
+
     def test_hit_and_victory_rewards_are_edge_triggered(self) -> None:
         tracker = RewardTracker()
         tracker.step(snapshot())
         hit = tracker.step(snapshot(stun_state="Stunned"))
         held = tracker.step(snapshot(stun_state="Stunned"))
-        self.assertEqual(hit.boss_hit, BOSS_HIT_REWARD)
-        self.assertEqual(held.boss_hit, 0.0)
+        self.assertEqual(hit.damage_deal, 1)
+        self.assertEqual(hit.damage_reward, DAMAGE_REWARD_PER_HP)
+        self.assertEqual(held.damage_reward, 0.0)
 
         victory = tracker.step(snapshot(death_state="Heart Death"))
         repeated = tracker.step(snapshot(death_state="Heart Death"))

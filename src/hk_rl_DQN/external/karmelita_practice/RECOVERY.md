@@ -48,7 +48,7 @@ personal save data and should not be committed or shared.
 - Save: slot 1 (`user1.dat`)
 - Build dependency: `Silksong.GameLibs 1.2.0-silksong1.0.29315`
 - Verified DLL SHA-256:
-  `C8CE2A482C9104B1BE3377B0FD91B46A030256488FFEDCA2EF073C65264CF464`
+  `0B7BAE5D7995460EB3A3994117021647EA3FE119B77D779E38E4D0BBAF1A1018`
 
 The hash applies only to the currently verified DLL. A source rebuild may
 produce a different hash even when behavior is equivalent.

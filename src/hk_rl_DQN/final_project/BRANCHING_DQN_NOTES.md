@@ -16,19 +16,19 @@
 建议动作空间：
 
 ```python
-MultiDiscrete([3, 2, 2, 2, 2, 2, 2, 2])
+MultiDiscrete([3, 4, 3, 3, 2, 2, 2, 2])
 ```
 
 分支顺序必须固定，并保存在检查点元数据中：
 
 ```text
 horizontal: [neutral, left, right]
-jump_z:     [released, held]
-dash_c:     [released, held]
-attack_x:   [released, held]
+jump_z:     [released, short_jump, hold_jump, double_jump]
+dash_c:     [released, dash, sustained_run]
+attack_x:   [released, tap_attack, attack_charge]
 skill_s:    [released, held]
 spell_shift:[released, held]
-dream_d:    [released, held]
+dream_d:    [released, disabled]
 taunt_v:    [released, held]
 ```
 
@@ -55,7 +55,7 @@ tensor([2, 1, 0, 1, 0, 0, 0, 0])
 - `LeftShift` 消耗灵丝，执行器结合当前灵丝、技能消耗、禁用状态以及
   游戏控制/冷却判定做合法性检查。
 
-状态观测必须加入 `X/C/S` 当前是否按住、累计时间，以及中断/可用状态，
+状态观测必须加入 `Z/X/C/S` 当前是否按住、累计时间，以及中断/可用状态，
 否则策略无法判断长按进度。
 
 不设置 `wall_jump` 分支。墙跳由 Agent 组合 `jump_z + left/right` 自行学习。
@@ -68,9 +68,9 @@ tensor([2, 1, 0, 1, 0, 0, 0, 0])
 features = shared_network(state)
 
 horizontal_q = horizontal_head(features)  # 3
-jump_q = jump_head(features)               # 2
-dash_q = dash_head(features)               # 2
-attack_q = attack_head(features)           # 2
+jump_q = jump_head(features)               # 4
+dash_q = dash_head(features)               # 3
+attack_q = attack_head(features)           # 3
 skill_q = skill_head(features)             # 2
 spell_q = spell_head(features)             # 2
 dream_q = dream_head(features)             # 2
@@ -91,11 +91,11 @@ advantage stream。共享环境奖励可以用于所有分支，但训练时应�
 3. `BossDodgeEnv.step(int)` 改为接收并验证 Multi-Discrete 向量。
 4. 环境在同一 tick 应用全部分支，而不是按动作名互斥处理。
 5. Double DQN 对每个分支分别选择下一动作，并从 target 网络 gather 对应值。
-6. epsilon-greedy 按分支探索，避免每次随机替换整个动作组合。
+6. epsilon-greedy 每个控制帧只判定一次；探索时整个动作向量从各分支当前合法值中采样。
 7. 动作掩码改成每分支掩码，结合灵丝、生命值、FSM 和冷却状态。
 8. 检查点保存分支名称、每分支大小、控制周期和动作协议版本。
 9. 真实执行器读取动作 Tensor/list，并把所有 held 分支转换为同时按键。
-10. JSONL 记录原始动作向量、解码后的动作、持续状态及被掩码/中断原因。
+10. JSONL 同时记录策略尝试向量和经过平滑、掩码及片段续接后的实际执行向量。
 
 ## 实施顺序
 

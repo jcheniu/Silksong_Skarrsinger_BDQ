@@ -15,6 +15,10 @@ internal sealed class TelemetryRecorder : IDisposable
     private readonly float intervalSeconds;
     private float nextSampleTime;
     private long sequence;
+    private HealthManager? observedBossHealth;
+    private int? previousBossHp;
+    private long bossDamageEvents;
+    private long bossDamageTotal;
 
     internal TelemetryRecorder(float intervalSeconds)
     {
@@ -40,6 +44,8 @@ internal sealed class TelemetryRecorder : IDisposable
     {
         HeroController? hero = HeroController.instance;
         Transform? boss = plugin.ActiveBoss;
+        ObserveBossDamageSource(boss);
+        UpdateBossDamageEvents();
         Rigidbody2D? heroBody = hero != null ? hero.GetComponent<Rigidbody2D>() : null;
         Rigidbody2D? bossBody = boss != null ? boss.GetComponent<Rigidbody2D>() : null;
         string scene = SceneManager.GetActiveScene().name;
@@ -67,6 +73,8 @@ internal sealed class TelemetryRecorder : IDisposable
         AppendPlayerControl(json, hero);
         json.Append(",\"boss\":");
         AppendTransform(json, boss, bossBody);
+        json.Append($",\"boss_damage_events\":{bossDamageEvents}");
+        json.Append($",\"boss_damage_total\":{bossDamageTotal}");
         json.Append(",\"fsm\":[");
         bool first = true;
         foreach (PlayMakerFSM fsm in Resources.FindObjectsOfTypeAll<PlayMakerFSM>())
@@ -89,6 +97,37 @@ internal sealed class TelemetryRecorder : IDisposable
         }
         json.Append("]}");
         writer.WriteLine(json.ToString());
+    }
+
+    private void ObserveBossDamageSource(Transform? boss)
+    {
+        HealthManager? current = boss != null
+            ? boss.GetComponent<HealthManager>() ?? boss.GetComponentInChildren<HealthManager>(true)
+            : null;
+        if (ReferenceEquals(current, observedBossHealth))
+        {
+            return;
+        }
+        observedBossHealth = current;
+        previousBossHp = current?.hp;
+        bossDamageEvents = 0;
+        bossDamageTotal = 0;
+    }
+
+    private void UpdateBossDamageEvents()
+    {
+        if (observedBossHealth == null)
+        {
+            previousBossHp = null;
+            return;
+        }
+        int currentHp = observedBossHealth.hp;
+        if (previousBossHp.HasValue && currentHp < previousBossHp.Value)
+        {
+            bossDamageEvents++;
+            bossDamageTotal += previousBossHp.Value - currentHp;
+        }
+        previousBossHp = currentHp;
     }
 
     private static void AppendPlayerResources(
@@ -125,7 +164,10 @@ internal sealed class TelemetryRecorder : IDisposable
             return;
         }
         json.Append($"{{\"jump_available\":{Bool(hero.CanJump())}");
+        json.Append($",\"double_jump_available\":{Bool(hero.CanDoubleJump(false))}");
         json.Append($",\"dash_available\":{Bool(hero.CanDash())}");
+        json.Append($",\"sprint_available\":{Bool(hero.CanSprint())}");
+        json.Append($",\"sprinting\":{Bool(hero.cState.isSprinting || hero.cState.isBackSprinting)}");
         json.Append($",\"attack_available\":{Bool(hero.CanAttack())}}}");
     }
 
@@ -177,6 +219,11 @@ internal sealed class TelemetryRecorder : IDisposable
 
     public void Dispose()
     {
+        if (observedBossHealth != null)
+        {
+            observedBossHealth = null;
+        }
+        previousBossHp = null;
         writer.WriteLine($"{{\"type\":\"telemetry_stop\",\"timestamp\":{Number(Time.realtimeSinceStartup)}}}");
         writer.Dispose();
     }

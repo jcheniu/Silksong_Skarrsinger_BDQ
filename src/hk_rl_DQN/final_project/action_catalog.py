@@ -25,13 +25,14 @@ ACTION_CATALOG: tuple[ActionSpec, ...] = (
     ActionSpec("right", "RightArrow", 100, False, "Move right"),
     ActionSpec("wait", None, 100, False, "No intentional input"),
     ActionSpec("jump", "Z", 0, False, "Jump"),
+    ActionSpec("jump_hold", "Z", 100, False, "Continue a long jump"),
+    ActionSpec("double_jump", "Z", 0, False, "Airborne second jump"),
     ActionSpec("dash", "C", 50, False, "Tap C for a dash"),
     ActionSpec("quick_run", "C", 300, False, "Hold C for fast run"),
     ActionSpec("attack", "X", 50, False, "Tap X for a normal attack"),
     ActionSpec("attack_charge", "X", 1350, False, "Hold X continuously for 1.35s / 81 frames; interruption invalidates the charge"),
     ActionSpec("quick_cast", "LeftShift", 50, True, "Cast the equipped spell; consumes silk"),
     ActionSpec("harpoon_dash", "S", 50, False, "Harpoon dash / KeySupDash"),
-    ActionSpec("dreamnail", "D", 50, False, "Contextual dreamnail action"),
     ActionSpec("taunt", "V", 50, False, "Battle taunt"),
 )
 

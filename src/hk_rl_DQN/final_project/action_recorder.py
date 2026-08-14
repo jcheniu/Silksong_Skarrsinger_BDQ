@@ -54,6 +54,9 @@ class ActionRecorder:
         branch_masks: Sequence[Sequence[bool]] | None = None,
         masked_reasons: Sequence[str] = (),
         player_resources: Mapping[str, object] | None = None,
+        attempted_action_vector: Sequence[int] | None = None,
+        illegal_branches: Sequence[str] = (),
+        newly_pressed_keys: Sequence[str] = (),
     ) -> dict[str, object]:
         names = tuple(dict.fromkeys(actions))
         if not names:
@@ -81,6 +84,12 @@ class ActionRecorder:
             item.update(charge_meta)
         if action_vector is not None:
             item["action_vector"] = [int(value) for value in action_vector]
+        if attempted_action_vector is not None:
+            item["attempted_action_vector"] = [
+                int(value) for value in attempted_action_vector
+            ]
+        item["illegal_branches"] = list(illegal_branches)
+        item["newly_pressed_keys"] = list(newly_pressed_keys)
         if branch_masks is not None:
             item["branch_masks"] = [
                 [bool(allowed) for allowed in branch] for branch in branch_masks

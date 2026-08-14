@@ -18,9 +18,9 @@ single-action baseline is preserved under `history/simulator_dqn_v1`.
 The action catalog is in `action_catalog.py`. It uses the local bindings:
 
 - `LeftArrow` / `RightArrow`: move (100 ms minimum test hold)
-- `Z`: jump; wall-jump behavior is learned by combining `Z` with `LeftArrow` or
-  `RightArrow` (there is no special `wall_jump` action)
-- `C`: tap for dash, hold for `quick_run`
+- `Z`: short jump, sustained hold-jump fragment, and a separate double-jump
+  pulse; there is no `wall_jump` action
+- `C`: separate dash and sustained-ground-run intents
 - `X`: tap for normal attack, or keep the `attack_charge` intent present over
   successive frames. The charge state accumulates toward 1.35 s (81 frames);
   omitting it, switching/releasing, or a hit interrupts and resets it.
@@ -28,8 +28,9 @@ The action catalog is in `action_catalog.py`. It uses the local bindings:
   and the game's control/cooldown result
 - `S`: harpoon dash (`KeySupDash`); legality uses `CanHarpoonDash()` and does
   not depend on current silk
-- `D`: contextual dreamnail
-- `V`: battle taunt
+- `D`: disabled and never sent by the live policy
+- `V`: battle taunt. Live training applies a small held cost and evaluates a
+  six-tick hit/hurt outcome window, so repeated unproductive taunts are penalized.
 
 Healing key `A` is disabled. `Q`, `I`, `Tab`, `J`, and `T` are also
 intentionally excluded.
