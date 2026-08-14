@@ -1,0 +1,44 @@
+% Shared layout for the two Chinese DQN reading guides.
+\usepackage[a4paper,includehead,top=20mm,bottom=20mm,left=21mm,right=21mm]{geometry}
+\usepackage{amsmath,amssymb,booktabs,longtable,array,graphicx,pdfpages}
+\usepackage{xcolor,tcolorbox,enumitem,fancyhdr,hyperref,microtype}
+\usepackage{tikz}
+\usetikzlibrary{arrows.meta,positioning,calc,fit}
+\definecolor{Ink}{HTML}{17212B}
+\definecolor{DeepGreen}{HTML}{176B5B}
+\definecolor{Coral}{HTML}{C84E3A}
+\definecolor{Gold}{HTML}{B27A16}
+\definecolor{Mist}{HTML}{EDF4F2}
+\definecolor{Warm}{HTML}{FFF5E8}
+\definecolor{Cool}{HTML}{EEF3FA}
+\definecolor{Rule}{HTML}{CCD6D3}
+\hypersetup{colorlinks=true,linkcolor=DeepGreen,urlcolor=Coral,citecolor=DeepGreen,pdfborder={0 0 0}}
+\setlength{\parindent}{2em}
+\setlength{\parskip}{0.35em}
+\setlist[itemize]{leftmargin=2em,itemsep=0.25em,topsep=0.35em}
+\setlist[enumerate]{leftmargin=2.2em,itemsep=0.25em,topsep=0.35em}
+\pagestyle{fancy}
+\setlength{\headheight}{22pt}
+\fancyhf{}
+\fancyhead[L]{\small\color{DeepGreen}\GuideShortTitle}
+\fancyhead[R]{\small\color{Ink}中文基础注释版}
+\fancyfoot[C]{\small\color{Ink}\thepage}
+\renewcommand{\headrulewidth}{0.4pt}
+\renewcommand{\headrule}{\hbox to\headwidth{\color{Rule}\leaders\hrule height \headrulewidth\hfill}}
+\newtcolorbox{plainbox}[1]{colback=Mist,colframe=DeepGreen,title={#1},fonttitle=\bfseries,boxrule=0.7pt,arc=2mm,left=2mm,right=2mm,top=1.5mm,bottom=1.5mm}
+\newtcolorbox{warnbox}[1]{colback=Warm,colframe=Gold,title={#1},fonttitle=\bfseries,boxrule=0.7pt,arc=2mm,left=2mm,right=2mm,top=1.5mm,bottom=1.5mm}
+\newtcolorbox{keybox}[1]{colback=Cool,colframe=Coral,title={#1},fonttitle=\bfseries,boxrule=0.7pt,arc=2mm,left=2mm,right=2mm,top=1.5mm,bottom=1.5mm}
+\newcommand{\term}[2]{\textbf{#1（#2）}}
+\newcommand{\origpage}[2]{%
+  \begin{center}
+  \fcolorbox{Rule}{white}{\includegraphics[page=#1,width=0.72\textwidth]{#2}}
+  \par\smallskip{\small\color{Ink}原论文第 #1 页缩略图，仅用于定位下文注释。}
+  \end{center}}
+\newcommand{\takeaway}[1]{\begin{plainbox}{本页先记住}\textbf{#1}\end{plainbox}}
+\newcommand{\checkq}[1]{\begin{warnbox}{自检}\small #1\end{warnbox}}
+\newcommand{\marginlabel}[1]{\textcolor{Coral}{\textbf{#1}}}
+\newcommand{\dif}{\mathop{}\!\mathrm{d}}
+\renewcommand{\contentsname}{阅读地图}
+\renewcommand{\figurename}{图}
+\renewcommand{\tablename}{表}
+\AtBeginDocument{\color{Ink}}

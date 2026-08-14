@@ -1,0 +1,6 @@
+<Project>
+  <PropertyGroup>
+    <SilksongFolder>C:\Path\To\Hollow Knight Silksong</SilksongFolder>
+    <SilksongPluginsFolder>$(SilksongFolder)\BepInEx\plugins</SilksongPluginsFolder>
+  </PropertyGroup>
+</Project>

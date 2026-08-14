@@ -1,0 +1,30 @@
+.venv/
+.pytest_cache/
+__pycache__/
+**/__pycache__/
+*.py[cod]
+
+# Local training output and checkpoints.
+/runs/
+/checkpoints/
+/src/runs/
+/src/checkpoints/
+/src/hk_rl_DQN/runs/
+/src/hk_rl_DQN/checkpoints/
+/history/manual_runs_*/
+
+# .NET build output.
+**/bin/
+**/obj/
+
+# Machine-local setup and save data.
+/_setup_cache/
+/local/
+src/hk_rl_DQN/external/karmelita_practice/backup/
+src/hk_rl_DQN/external/karmelita_practice/SilksongPath.props
+
+# Local editor/OS files.
+.vs/
+*.user
+*.suo
+desktop.ini

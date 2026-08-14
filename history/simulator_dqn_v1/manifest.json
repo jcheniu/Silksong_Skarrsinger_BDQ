@@ -1,0 +1,20 @@
+{
+  "archive": "simulator_dqn_v1",
+  "archived_on": "2026-08-14",
+  "status": "frozen_reference",
+  "implementation": "single-action simulator Double DQN",
+  "active_replacement": "src/hk_rl_DQN/real_dqn.py",
+  "checkpoint_compatible_with_active": false,
+  "artifact_sha256": {
+    "artifacts/checkpoints/dqn.pt": "A731059F920B91DE1C43351348B98F55659215DB08E9ECE0D9E839727AD199D9",
+    "artifacts/runs/dqn.json": "451E81A411C2DE36051FFDF005B373AE8D1B15F99FF7D392FCC53296EF99A5A4"
+  },
+  "contents": [
+    "src/hk_rl_DQN",
+    "tests",
+    "artifacts/checkpoints/dqn.pt",
+    "artifacts/runs/dqn.json",
+    "docs/ACTION_CATALOG.md",
+    "OLD_README.md"
+  ]
+}

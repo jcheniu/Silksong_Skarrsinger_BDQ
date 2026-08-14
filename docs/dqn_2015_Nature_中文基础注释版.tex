@@ -1,0 +1,418 @@
+\documentclass[UTF8,11pt]{ctexart}
+\newcommand{\GuideShortTitle}{DQN 2015 Nature：成熟版}
+\input{dqn_notes_common.tex}
+\newcommand{\OriginalPDF}{Mnih_et_al_2015_DQN_Nature14236.pdf}
+\title{\bfseries\Huge Human-level control through deep reinforcement learning\\[3mm]\Large Nature 2015 DQN 中文基础注释版}
+\author{原作者：Volodymyr Mnih 等\\注释稿：基于 DeepMind 公开 PDF 编写}
+\date{Nature 518, 529--533 (2015)；DOI: 10.1038/nature14236}
+
+\begin{document}
+\maketitle
+\thispagestyle{empty}
+\vfill
+\begin{keybox}{先把论文定位说清楚}
+这是 DQN 的\textbf{成熟 Nature 版本}，不是最早提出 DQN 的版本。2013 年《Playing Atari with Deep Reinforcement Learning》首次展示了深度卷积 Q-learning 与经验回放；本篇增加并突出\textbf{独立 target network}，把评测扩展到 49 个 Atari 游戏，提供人类基准、表示可视化与消融实验。
+\end{keybox}
+\begin{plainbox}{适合谁读}
+面向第一次接触强化学习的读者。注释从“状态、动作、奖励”开始，不假定学过 Bellman 方程、Q-learning 或卷积网络。正文按原论文 13 页定位，最后附算法推演、实验批判和术语表。
+\end{plainbox}
+\vfill
+\noindent\small 本文是教学性注释与释义，不是逐句翻译。原论文图页以缩略图用于定位，论文原文是最终依据。
+\clearpage
+
+\tableofcontents
+\clearpage
+
+\section{零基础入口：从游戏交互到 DQN}
+
+\subsection{四个对象与一个目标}
+强化学习的最小词汇是：\term{智能体}{agent}、\term{环境}{environment}、\term{动作}{action}、\term{奖励}{reward}。在 Atari 中，智能体是 DQN，环境是模拟器，动作是摇杆与按键组合，奖励通常是游戏分数的变化。交互循环为
+\[
+s_t \xrightarrow{a_t} (r_t,s_{t+1}).
+\]
+智能体希望最大化折扣累计回报
+\[
+R_t=\sum_{k=0}^{T-t}\gamma^k r_{t+k},\qquad 0\leq\gamma<1.
+\]
+论文统一使用 $\gamma=0.99$。粗略说，100 步后的奖励权重约为 $0.99^{100}\approx0.366$，所以远期奖励仍有影响但会逐渐减弱。
+
+\subsection{Q 函数是“动作的长期评分器”}
+最优动作价值函数为
+\[
+Q^*(s,a)=\max_\pi\mathbb E[R_t\mid s_t=s,a_t=a,\pi].
+\]
+它回答：“在状态 $s$ 先做 $a$，之后尽量做对，最终能拿多少分？”最优策略只需选择
+\[
+\pi^*(s)=\arg\max_a Q^*(s,a).
+\]
+DQN 用神经网络 $Q(s,a;\theta)$ 近似 $Q^*$。网络输入状态，只做一次前向传播就输出所有合法动作的 Q 值。
+
+\subsection{Bellman 方程是训练标签生成器}
+最优 Q 值满足
+\[
+Q^*(s,a)=\mathbb E_{s'}\left[r+\gamma\max_{a'}Q^*(s',a')\mid s,a\right].
+\]
+因此可以用
+\[
+y=r+\gamma\max_{a'}\widehat Q(s',a';\theta^-)
+\]
+作为回归目标，让在线网络 $Q(s,a;\theta)$ 靠近 $y$。这里的 $\widehat Q$ 是\term{目标网络}{target network}，参数 $\theta^-$ 暂时固定。损失为
+\[
+L(\theta)=\mathbb E_{(s,a,r,s')\sim D}\left[\ell\bigl(y-Q(s,a;\theta)\bigr)\right].
+\]
+论文对大误差作裁剪，效果类似误差小时用平方损失、误差大时用绝对值损失，减少异常 TD 误差造成的巨大梯度。
+
+\begin{plainbox}{一句直觉}
+在线网络像正在答题的学生；目标网络像每隔一段时间才更新一次的参考答案。若学生每写一个字，参考答案也同步跟着改，学习目标会追着自己移动；冻结一段时间能让回归问题更稳定。
+\end{plainbox}
+
+\subsection{DQN 的两根稳定支柱}
+\begin{enumerate}
+\item \textbf{经验回放}：把转移存入 $D$，随机采样小批量，打散连续帧相关性并重复利用经验。
+\item \textbf{目标网络}：用较旧参数 $\theta^-$ 构造 TD 目标，每隔 $C$ 次更新才令 $\theta^-\leftarrow\theta$。
+\end{enumerate}
+它们不保证数学上绝不发散，但在实验中显著提升稳定性。
+
+\section{第 1 页：摘要、宏观论点与 Figure 1}
+\origpage{1}{\OriginalPDF}
+\takeaway{作者声称一个算法能在 49 个游戏上从像素和分数学习，并在多数游戏超过此前算法，在一部分游戏达到专业人类基准。}
+
+\subsection{标题中的 human-level 到底指什么}
+“人类水平”不是说智能体具有人的通用理解。论文定义的是特定评测协议下的游戏分数：
+\[
+\text{human-normalized score}
+=\frac{\text{DQN}-\text{random}}{\text{human}-\text{random}}.
+\]
+达到 100\% 表示匹配论文中那位专业测试者的基准，不表示任何人、任何起始状态或任何训练预算下都相当。DQN 在 49 个游戏中的 29 个达到这一阈值，而不是全部。
+
+\subsection{Figure 1 网络从像素到动作价值}
+输入是 $84\times84\times4$ 的灰度帧堆叠。三层卷积提取局部运动与物体结构，512 单元全连接层汇总全局信息，线性输出层为每个合法动作给出一个 Q 值。最后一层不用 softmax，因为 Q 值不是概率，可以为负，也不要求和为 1。
+
+\begin{keybox}{端到端不等于没有人工选择}
+特征参数由奖励端到端训练，但研究者仍提供了视觉卷积结构、四帧堆叠、奖励裁剪、动作重复、优化器等强先验。更准确的说法是“没有游戏专属的手工视觉特征”，而非“完全没有先验”。
+\end{keybox}
+
+\section{第 2 页：为什么深度强化学习不稳定}
+\origpage{2}{\OriginalPDF}
+\takeaway{深度网络、Q-learning 与在线轨迹直接结合时，数据相关、分布漂移和移动目标会形成反馈环。}
+
+\subsection{监督学习与 DQN 标签的差别}
+监督学习的数据标签通常固定，例如猫图始终标成“猫”。DQN 的标签
+\[
+y=r+\gamma\max_{a'}\widehat Q(s',a';\theta^-)
+\]
+由另一个网络估计。网络学得越多，标签也会变化，这叫\term{非平稳目标}{non-stationary target}。此外，行为策略依赖当前 Q 值，参数变化还会改变未来收集到的数据。
+
+\subsection{三个危险因素}
+\begin{itemize}
+\item \textbf{函数逼近}：一个参数更新同时影响许多状态的估值。
+\item \textbf{自举}：用自己的估计构造目标，误差可能被递归传播。
+\item \textbf{离策略}：用旧策略或探索策略数据学习贪心目标策略。
+\end{itemize}
+这组组合后来常被称为\term{致命三元组}{deadly triad}。DQN 的价值在于用工程机制把这个危险组合变得可训练。
+
+\subsection{经验回放的三重作用}
+每个转移 $e_t=(s_t,a_t,r_t,s_{t+1})$ 被放入容量 $N$ 的循环缓冲区。均匀随机采样能降低时间相关、提高样本复用，并把多个历史策略的数据混合起来。因为样本由旧参数产生，算法必须允许离策略数据，这与 Q-learning 正好匹配。
+
+\checkq{经验回放会不会让数据完全独立同分布？不会。缓冲区仍随时间更新，状态访问频率也由行为策略决定；它只是把强烈的短期相关和分布突变缓和。}
+
+\section{第 3 页：训练曲线与价值预测}
+\origpage{3}{\OriginalPDF}
+\takeaway{Figure 2 同时画实际得分和固定状态集上的平均 Q 值，用两个角度观察学习是否进展。}
+
+\subsection{为什么要看两种曲线}
+episode score 直接反映行为结果，但方差大；固定验证状态集上的平均 $\max_a Q(s,a)$ 更平滑，却可能因过估计而虚高。两者一起上升比只看一条更可信。若 Q 值持续上升而分数停滞，应怀疑价值尺度漂移或过估计。
+
+\subsection{训练 2 亿帧与 5000 万 agent steps}
+智能体每选一个动作，模拟器重复该动作 4 帧，即\term{frame skip}{动作重复}为 4。论文常把训练规模说成 5000 万次动作选择，也即约 2 亿原始视频帧；按 60 帧/秒计算约 38 天游戏时间。阅读复现报告时必须确认“frames”指原始帧还是 agent steps，否则训练预算可能差 4 倍。
+
+\subsection{探索日程}
+训练行为采用 $\varepsilon$-greedy：$\varepsilon$ 在前 100 万帧从 1.0 线性降到 0.1，之后固定 0.1。评估使用 $\varepsilon=0.05$。测试仍保留少量随机动作，是为了避免确定性轨迹和对固定起始序列过拟合。
+
+\section{第 4 页：49 游戏结果与归一化}
+\origpage{4}{\OriginalPDF}
+\takeaway{DQN 在 49 个游戏中的 43 个超过最佳既有 RL 方法，29 个达到论文定义的人类基准，但表现分布很不均匀。}
+
+\subsection{Figure 3 的坐标怎么读}
+每个游戏先用随机与人类分数归一化。横轴/纵轴比较 DQN 与不同基线，点落在对角线上方表示 DQN 更好。对数或截断尺度可能压缩极端值，应结合扩展数据中的原始分数表阅读。
+
+\subsection{均值为何容易误导}
+某些游戏上超人很多倍会拉高平均归一化分数，而另一些游戏接近随机。更稳妥的是同时报告中位数、每游戏分布、达到人类阈值的游戏数。论文的核心说服力来自跨任务覆盖，而不是一个总平均数。
+
+\begin{warnbox}{“超过人类”的四个限定}
+\begin{itemize}
+\item 人类是约 2 小时练习后的单个专业测试者基准。
+\item 智能体训练经历约 38 天游戏时间，样本量远大于人类。
+\item 智能体只看图像且没有声音；人类也在受控条件下禁用声音。
+\item 比较的是 5 分钟 episode 分数，不是适应新游戏、迁移或规则解释能力。
+\end{itemize}
+\end{warnbox}
+
+\section{第 5 页：表示学习、t-SNE 与结论}
+\origpage{5}{\OriginalPDF}
+\takeaway{Figure 4 试图说明网络隐藏表示按“未来价值与局面语义”组织，但二维投影只能作为探索性证据。}
+
+\subsection{t-SNE 是什么}
+t-SNE 把 512 维隐藏向量投影到二维，尽量让高维中相近的点在图上靠近。聚簇表明网络对某些局面给出相似表示；相邻截图出现语义相似的游戏状态，是表示学习成功的直观线索。
+
+\subsection{不能从 t-SNE 推出什么}
+t-SNE 会扭曲全局距离，簇间远近不一定有定量意义；不同随机种子和超参数可能得到不同布局。它不能证明网络“理解”游戏，也不能替代控制性能或因果干预。正确读法是：可视化与价值曲线相互支持，而非单独定论。
+
+\subsection{论文结论的边界}
+研究证明通用网络和学习规则能在大量视觉控制任务中取得强性能，并显示表示会捕捉奖励相关结构。它仍依赖海量训练、离散动作、固定任务、密集游戏分数和模拟器速度。现实机器人中的安全、样本成本与观测噪声并未被解决。
+
+\section{第 6 页：Methods 总览与预处理}
+\origpage{6}{\OriginalPDF}
+\takeaway{方法细节决定能否复现：最大化相邻两帧去闪烁、亮度通道、$84\times84$ 缩放和四帧堆叠都很关键。}
+
+\subsection{为何对相邻帧逐像素取最大值}
+Atari 硬件一次显示的精灵有限，有些物体只在奇数帧或偶数帧出现，形成闪烁。对当前帧和上一帧的每个像素取最大值，能保留只出现一次的物体。这不是普通降噪，而是针对模拟器显示机制的处理。
+
+\subsection{从 RGB 到亮度}
+原始画面约为 $210\times160$、128 色。论文取亮度 $Y$ 通道并缩放至 $84\times84$。降维显著减少计算和回放内存。颜色信息被舍弃，说明这些任务多数可依赖亮度与运动完成；但它也是潜在性能上限。
+
+\subsection{部分可观测与状态近似}
+模拟器内部状态对智能体不可见，单帧存在\term{感知混叠}{perceptual aliasing}：外观相同的画面可能对应不同速度或隐藏变量。完整历史理论上可作为状态，但长度无限。四帧堆叠是有限、可计算的近似，并不真正解决长期记忆。
+
+\section{第 7 页：网络结构逐层算形状}
+\origpage{7}{\OriginalPDF}
+\takeaway{三层卷积把 $84\times84\times4$ 压缩成空间特征，再由 512 单元汇总，最后输出 4 到 18 个动作价值。}
+
+卷积输出边长公式为
+\[
+H_{out}=\left\lfloor\frac{H_{in}-K}{S}\right\rfloor+1,
+\]
+其中 $K$ 是卷积核边长，$S$ 是步幅。忽略批量维，逐层形状为：
+\begin{longtable}{p{0.20\textwidth}p{0.27\textwidth}p{0.38\textwidth}}
+\toprule
+层 & 输出形状 & 说明\\
+\midrule
+输入 & $84\times84\times4$ & 最近四帧灰度图\\
+Conv1 & $20\times20\times32$ & $32$ 个 $8\times8$ 核，stride 4，ReLU\\
+Conv2 & $9\times9\times64$ & $64$ 个 $4\times4$ 核，stride 2，ReLU\\
+Conv3 & $7\times7\times64$ & $64$ 个 $3\times3$ 核，stride 1，ReLU\\
+Flatten & $3136$ & $7\cdot7\cdot64$\\
+FC & $512$ & ReLU 全连接隐藏层\\
+输出 & $|A|$ & 线性 Q 值，游戏不同为 4--18\\
+\bottomrule
+\end{longtable}
+
+\subsection{为什么输出每个动作而不是把动作也作为输入}
+若状态和动作一起输入、网络只输出一个标量，求 $\max_aQ(s,a)$ 需要对每个动作分别前向传播。DQN 的多输出结构一次算出所有动作价值，离散动作少时更高效。它不直接适合高维连续动作，因为无法枚举所有 $a$；这推动了 DDPG 等 actor--critic 方法。
+
+\subsection{参数共享如何发生}
+所有动作共享卷积层与 512 维隐藏表示，只在最后输出权重上分叉。因此“球在哪里”“敌人是什么”等视觉特征可以被多个动作共同利用。更新某个动作的 TD 误差时，共享特征也会改变，可能促进迁移，也可能造成动作间干扰。
+
+\section{第 8 页：训练细节与评估协议}
+\origpage{8}{\OriginalPDF}
+\takeaway{同一架构并不意味着一个网络玩所有游戏；论文为每个游戏单独训练网络，只共享算法和超参数。}
+
+\subsection{训练设置}
+主要设置包括：minibatch 32；RMSProp 优化；回放容量 100 万帧；$\gamma=0.99$；动作重复 4；训练 5000 万 agent steps；正负奖励分别裁到 $+1/-1$。参数仅在 5 个验证游戏上非系统调试，再固定到其他游戏。
+
+\begin{warnbox}{常见误读}
+“同一个算法玩 49 个游戏”不等于“同一个训练好的智能体同时玩 49 个游戏”。论文为每个游戏从头训练一个独立 DQN；通用的是架构、学习规则与主要超参数。
+\end{warnbox}
+
+\subsection{生命损失被当作训练终止}
+对于有生命计数的游戏，训练时丢一条命被标作 episode 结束，便于学习避免死亡；评估仍在原游戏规则下进行。这加入了少量游戏接口信息，也改变了 bootstrap 边界，是复现时不能漏掉的细节。
+
+\subsection{30 次、随机 no-op 与 5 分钟上限}
+每个训练后智能体评估 30 局，每局最多 5 分钟；开局加入随机数量的 no-op，降低对单一确定性初始轨迹的记忆。行为采用 $\varepsilon=0.05$。但随机 no-op 只产生有限随机性，后来 Machado 等人的 sticky actions 协议进一步增强环境随机性。
+
+\section{第 9 页：Bellman 损失与梯度}
+\origpage{9}{\OriginalPDF}
+\takeaway{DQN 把控制问题变成重复的回归问题，但回归标签来自冻结一段时间的旧网络。}
+
+设在线参数为 $\theta_i$，目标参数为 $\theta^-_i$。对一条非终止转移：
+\[
+y_i=r+\gamma\max_{a'}\widehat Q(s',a';\theta^-_i),
+\qquad
+\delta_i=y_i-Q(s,a;\theta_i).
+\]
+平方损失梯度为
+\[
+\nabla_{\theta_i}L_i
+=\mathbb E\left[-2\delta_i\nabla_{\theta_i}Q(s,a;\theta_i)\right].
+\]
+目标分支在这一更新中视为常数，不让梯度穿过 $y_i$。每隔 $C$ 次更新执行 $\theta^-\leftarrow\theta$，目标会跳变一次，随后再次固定。
+
+\subsection{最大化偏差}
+若多个动作估计都含噪声，取最大值更容易选中被高估的那个：
+\[
+\mathbb E[\max_a\widehat Q_a]\geq\max_a\mathbb E[\widehat Q_a].
+\]
+DQN 的同一目标网络既选择又评估动作，仍有过估计。Double DQN 用在线网络选择 $\arg\max$，目标网络评估该动作，减少这种偏差。
+
+\subsection{误差裁剪}
+论文把 TD 误差对梯度的影响限制在 $[-1,1]$，相当于今天常说的 Huber 型损失：
+\[
+\ell_\kappa(\delta)=
+\begin{cases}
+\frac12\delta^2,&|\delta|\leq1,\\
+|\delta|-\frac12,&|\delta|>1.
+\end{cases}
+\]
+小误差保持平滑二次优化，大误差转为线性增长，避免少数异常样本主导更新。
+
+\section{第 10 页：Algorithm 1 逐行注释}
+\origpage{10}{\OriginalPDF}
+\takeaway{在线网络负责选择动作和被优化；目标网络只负责产生较稳定的 TD 标签。}
+
+\begin{enumerate}
+\item 初始化回放池 $D$、在线网络 $Q(\cdot;\theta)$，复制出目标网络 $\widehat Q(\cdot;\theta^-)$。
+\item 对每个时刻，以 $\varepsilon$ 概率随机动作，否则取 $\arg\max_aQ(s_t,a;\theta)$。
+\item 执行动作，观察 $r_t$ 与新画面，预处理成下一状态。
+\item 存储 $(s_t,a_t,r_t,s_{t+1},done)$。
+\item 均匀随机抽取 32 条转移。
+\item 对终止样本令 $y=r$；否则令 $y=r+\gamma\max_{a'}\widehat Q(s',a';\theta^-)$。
+\item 仅对在线参数 $\theta$ 最小化 $\ell(y-Q(s,a;\theta))$。
+\item 每隔 $C$ 次更新将在线参数复制给目标网络。
+\end{enumerate}
+
+\subsection{为什么是“离策略”}
+缓冲池包含过去多个 $\varepsilon$ 值和多个旧网络产生的行为，当前更新却学习贪心最优 Q 函数。数据生成策略与目标策略不同，因此是离策略。若使用严格 on-policy 方法，随意回放旧经验通常会引入需要校正的分布问题。
+
+\subsection{为什么是“无模型”}
+DQN 不显式学习 $P(s'\mid s,a)$ 或奖励模型，也不在内部模拟未来画面。它直接从真实转移学习价值，因此称 model-free。这不表示它没有神经网络模型；“model”在此特指环境动力学模型。
+
+\section{第 11 页：人类与 DQN 表示的扩展可视化}
+\origpage{11}{\OriginalPDF}
+\takeaway{人类轨迹和 DQN 轨迹在隐藏表示中出现重叠结构，提示表示能泛化到非自身策略的数据，但证据仍是相关性的。}
+
+Extended Data Figure 1 把人类游玩 30 分钟和 DQN 游玩 2 小时的 Space Invaders 状态共同送入网络，再对最后隐藏层做 t-SNE。相似局面靠近说明网络没有只记住自身轨迹的像素模板。不过，二维重叠不直接说明人类与智能体采取同一策略，也不证明隐藏单元具有可命名语义。
+
+\section{第 12 页：价值函数可视化}
+\origpage{12}{\OriginalPDF}
+\takeaway{价值峰值会提前出现在即将得分或突破砖墙之前，展示了 TD 学习如何把未来奖励向前传播。}
+
+在 Breakout 中，球即将穿过砖墙进入上方、随后连续撞砖时，状态价值提前上升。这是 Bellman 自举多次传播的结果：奖励先提高临近状态的 Q 值，再在后续更新中逐步影响更早状态。Pong 的动作价值分叉则展示了“同一状态下不同动作后果不同”。
+
+\begin{plainbox}{从 Q 到 V}
+论文图中常画状态价值，可由动作价值得到
+\[
+V(s)=\max_a Q(s,a).
+\]
+$V$ 回答“这个局面整体有多好”，$Q$ 还回答“在这个局面做哪个动作更好”。控制必须保留动作维度。
+\end{plainbox}
+
+\section{第 13 页：超参数、完整结果与消融}
+\origpage{13}{\OriginalPDF}
+\takeaway{扩展表格不仅给分数，还测试回放、目标网络和深度非线性表示分别贡献了什么。}
+
+\subsection{Extended Data Table 1：复现清单}
+超参数表是复现核心。除学习率、折扣、回放容量外，还要核对 target 更新周期、replay start size、更新频率、动作重复、优化器中的梯度统计设置。相同“DQN”名称若这些细节不同，性能可能差很大。
+
+\subsection{Extended Data Table 2：49 游戏原始结果}
+原始分数让读者看到归一化背后的尺度与失败案例。应重点寻找：DQN 明显落后的游戏是否需要长期探索、计数、精细反应或颜色信息；这些失败模式比只看总胜率更能说明算法能力边界。
+
+\subsection{Extended Data Table 3：两种稳定机制的消融}
+作者组合开/关经验回放与 target network，并测试多个学习率。总体结论是两者共同使用最稳。消融的逻辑是保持其余设置尽量相同，只移除一个组件，看结果变化。它支持“组件有用”，但受训练仅 1000 万帧、游戏子集和随机性限制。
+
+\subsection{Extended Data Table 4：深层表示是否必要}
+把卷积深网替换为线性函数逼近，同时保留回放和目标网络，表现明显下降。这说明成功不只来自稳定化技巧；从像素学习的非线性层级表示也是关键。
+
+\section{一个完整更新的数值演算}
+假设 minibatch 中一条样本为：$r=1$，非终止，$\gamma=0.99$。目标网络在下一状态输出
+\[
+\widehat Q(s',\cdot;\theta^-)=[1.4,\ 2.8,\ 2.1,\ 0.5],
+\]
+在线网络对当前状态所执行动作的预测为 $Q(s,a;\theta)=1.7$。则
+\[
+y=1+0.99\times2.8=3.772,
+\qquad \delta=3.772-1.7=2.072.
+\]
+误差大于 1，裁剪/Huber 型梯度不会按 $2.072$ 的幅度无限放大，而以近似常数斜率推动预测上升。若这一步是终止转移，则 $y=1$，不能加下一状态价值。
+
+\begin{warnbox}{注意 target network 不选择当前行为}
+环境中的动作通常由在线网络 $Q(\cdot;\theta)$ 的 $\varepsilon$-greedy 策略选择。目标网络 $\widehat Q$ 只参与训练标签计算，不直接控制智能体。
+\end{warnbox}
+
+\section{为什么 DQN 有效，又为什么还不够}
+\subsection{有效的原因}
+\begin{itemize}
+\item 卷积网络提供适合图像的局部性与平移共享先验。
+\item Q-learning 把稀疏的未来奖励逐步向前传播。
+\item 经验回放改善样本复用并缓和在线相关。
+\item 目标网络降低预测与标签同步变化的正反馈。
+\item 奖励与误差裁剪统一尺度，便于跨游戏使用一套设置。
+\end{itemize}
+
+\subsection{论文留下的局限}
+\begin{itemize}
+\item \textbf{样本效率低}：约 2 亿原始帧/游戏，远多于人类练习量。
+\item \textbf{探索简单}：$\varepsilon$-greedy 对长时、稀疏奖励任务很弱。
+\item \textbf{短记忆}：四帧不能处理长程部分可观测问题。
+\item \textbf{过估计}：最大化同一估计器的噪声。
+\item \textbf{回放均匀}：关键稀有转移与普通转移同概率抽样。
+\item \textbf{任务隔离}：每个游戏独立训练，没有跨游戏迁移或持续学习。
+\item \textbf{评估脆弱性}：确定性模拟器与 no-op 起始仍可能被特定策略利用。
+\end{itemize}
+
+\subsection{后来改进与对应问题}
+\begin{longtable}{p{0.25\textwidth}p{0.28\textwidth}p{0.36\textwidth}}
+\toprule
+方法 & 针对问题 & 核心想法\\
+\midrule
+Double DQN & Q 值过估计 & 在线网选动作，目标网评估动作。\\
+Dueling Network & 状态价值与动作优势混合 & 分别估计 $V(s)$ 和 $A(s,a)$ 后组合。\\
+Prioritized Replay & 均匀回放效率低 & TD 误差大或信息量高的转移更常采样，并做重要性校正。\\
+Multi-step returns & 奖励传播慢 & 用多步真实奖励后再 bootstrap。\\
+Distributional RL & 只估计期望 & 学习回报分布而非单个均值。\\
+Noisy Nets & 探索粗糙 & 在参数空间加入可学习噪声。\\
+Rainbow & 单项改进分散 & 组合多种相容改进。\\
+\bottomrule
+\end{longtable}
+
+\section{2013 与 2015 两篇该怎样引用}
+\begin{plainbox}{若你在写“DQN 首次提出”}
+引用 Mnih et al., \textit{Playing Atari with Deep Reinforcement Learning}, arXiv:1312.5602 (2013)。这篇首次展示 DQN 系统与 7 个游戏结果。
+\end{plainbox}
+\begin{plainbox}{若你在写“Nature DQN / human-level Atari”}
+引用 Mnih et al., \textit{Human-level control through deep reinforcement learning}, Nature 518, 529--533 (2015), DOI: 10.1038/nature14236。它是 49 游戏、target network 和系统评测的成熟版本。
+\end{plainbox}
+
+\section{术语表}
+\begin{longtable}{p{0.25\textwidth}p{0.67\textwidth}}
+\toprule
+术语 & 中文基础解释\\
+\midrule
+observation / 观察 & 智能体直接收到的信息，如当前屏幕；不一定包含完整环境状态。\\
+state / 状态 & 理论上足以预测未来的信息；论文用四帧作为近似状态表示。\\
+policy / 策略 & 从状态到动作选择概率的规则。\\
+return / 回报 & 从当前起的折扣累计奖励。\\
+Q-value / 动作价值 & 在某状态先做某动作后的预期回报。\\
+Bellman equation & 把长期价值写成一步奖励加下一状态价值的递归关系。\\
+TD error & TD 目标与当前预测之差 $\delta=y-Q$。\\
+bootstrapping / 自举 & 用已有价值估计构造新目标。\\
+experience replay & 保存历史转移并随机采样训练。\\
+online network & 被梯度更新、用于行为选择的 Q 网络。\\
+target network & 暂时冻结、周期复制在线参数、用于生成 TD 目标的网络。\\
+off-policy & 行为数据的策略与希望学习的目标策略不同。\\
+model-free & 不显式学习环境转移与奖励模型。\\
+reward clipping & 把奖励限制到固定范围，统一尺度但丢失幅度信息。\\
+frame skip & 一次选择动作后重复若干原始帧，减少决策计算。\\
+human normalization & 用随机和人类分数把不同游戏映射到可比较尺度。\\
+ablation / 消融 & 移除或替换组件，观察性能变化以判断其贡献。\\
+\bottomrule
+\end{longtable}
+
+\section{自测题}
+\begin{enumerate}
+\item \textbf{为何 target network 能稳定训练？} 它把 TD 标签冻结一段时间，减弱在线更新立刻反过来推高自身目标的反馈。
+\item \textbf{为何经验回放要求算法适合离策略数据？} 缓冲区样本由过去不同策略产生，不等于当前行为策略。
+\item \textbf{输出层为何不使用 softmax？} Q 值是任意实数的长期回报估计，不是类别概率。
+\item \textbf{四帧堆叠解决了什么，没解决什么？} 提供短期速度方向；不能保存跨很长时间的记忆。
+\item \textbf{human-normalized 100\% 表示什么？} 匹配论文特定人类测试者与协议下的分数，不表示一般意义的类人智能。
+\item \textbf{论文中一个网络是否同时玩 49 个游戏？} 否。每个游戏独立训练；共享的是架构、算法和主要超参数。
+\item \textbf{2015 版相对 2013 版最关键新增机制？} 独立 target network 周期更新，以及更大规模、更系统的评测与消融。
+\end{enumerate}
+
+\begin{keybox}{全篇一句话}
+Nature DQN 用卷积网络从四帧像素近似动作价值，以经验回放打散在线数据，以冻结并周期更新的目标网络稳定 Bellman 自举，在 49 个 Atari 游戏上证明了深度表示学习与强化学习可以形成一套通用而强大的视觉控制方法。
+\end{keybox}
+
+\section*{版本说明}
+本注释稿基于 DeepMind 公开的 13 页 Nature PDF 编写。为教学清晰，使用了现代常见的 $\theta/\theta^-$、Huber 型损失等记号解释原文实现；这些释义不改变算法含义。本文不代表原作者、DeepMind 或 Nature。
+
+\end{document}

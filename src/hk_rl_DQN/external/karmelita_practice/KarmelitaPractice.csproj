@@ -1,0 +1,22 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <Import Condition="Exists('SilksongPath.props')" Project="SilksongPath.props" />
+  <PropertyGroup>
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <AssemblyName>KarmelitaPractice</AssemblyName>
+    <Version>0.1.0</Version>
+  </PropertyGroup>
+  <ItemGroup>
+    <PackageReference Include="BepInEx.Core" Version="5.4.21" />
+    <PackageReference Include="HarmonyX" Version="2.9.0" />
+    <PackageReference Include="Hamunii.BepInEx.AutoPlugin" Version="2.0.1" PrivateAssets="all" />
+    <PackageReference Include="UnityEngine.Modules" Version="6000.0.50" IncludeAssets="compile" />
+    <PackageReference Include="Silksong.GameLibs" Version="1.2.0-silksong1.0.29315" PrivateAssets="all" />
+  </ItemGroup>
+  <Target Name="DeployMod" AfterTargets="Build" Condition="'$(SilksongPluginsFolder)' != '' And Exists('$(SilksongPluginsFolder)')">
+    <MakeDir Directories="$(SilksongPluginsFolder)\hollow-knight-rl-KarmelitaPractice" />
+    <Copy SourceFiles="$(TargetPath)" DestinationFolder="$(SilksongPluginsFolder)\hollow-knight-rl-KarmelitaPractice" />
+    <Copy SourceFiles="$(TargetDir)$(TargetName).pdb" DestinationFolder="$(SilksongPluginsFolder)\hollow-knight-rl-KarmelitaPractice" Condition="Exists('$(TargetDir)$(TargetName).pdb')" />
+  </Target>
+</Project>

@@ -1,0 +1,43 @@
+{
+  "archive_id": "phase1-q-table-v1",
+  "created_on": "2026-07-28",
+  "status": "frozen",
+  "python_requires": ">=3.11",
+  "algorithm": "expected-sarsa-lambda",
+  "policy_representation": "q-table",
+  "state_encoding": "compact-v17-no-hp-repeat2",
+  "state_dimensions": 12,
+  "q_states": 10130,
+  "training_episodes": 50000,
+  "recorded_episode_rewards": 10000,
+  "saved_evaluation": {
+    "episodes": 100,
+    "win_rate": 0.81,
+    "average_damage_taken": 1.43,
+    "average_spike_escape_timeouts": 0.98
+  },
+  "verification_evaluation": {
+    "date": "2026-07-28",
+    "episodes": 100,
+    "seed": 1000,
+    "win_rate": 0.83,
+    "average_damage_taken": 1.43,
+    "average_spike_escape_timeouts": 0.97
+  },
+  "regression_tests": {
+    "passed": 57,
+    "failed": 0
+  },
+  "sha256": {
+    "hk_rl/boss_env.py": "0c7e4c09a2a739123257c3c68f583c7ea1f27abf36b96680aadbc05bf9fe6940",
+    "hk_rl/train_q.py": "fc4fca06261ffd3d18e633d75630cf9fdbeac02af972724e409381c4f7792943",
+    "hk_rl/visualize.py": "8fcaf6f6a38f957d441df0e15f6b1765d6092ce69ff68d430b1eae7b78cf1966",
+    "hk_rl/__init__.py": "315bd2a7cd4eb5704dd058325907fb2658323e7ab61fbb39720e30656fc334cb",
+    "hk_rl/test_boss_env.py": "ae8a4293c4601b21059c5cf43a7a4be17ca0abc18357555ac43f4086622e2df2",
+    "hk_rl/test_train_q.py": "9c77862dc2fbd2b5b5b2f457e16da1e58abe5c28d306a4315538dff2812d9f2d",
+    "hk_rl/test_visualize.py": "50e03372c6b44dbcb9386ec7a38b606c3f3852f755ba82f96eddf31695946f09",
+    "tests/test_boss_env.py": "171d2dd67105b97448685085ca9f549ef89d183308ea0dffe46b0d9497c8bc7b",
+    "checkpoints/q_table.json": "980416f975c18ec55b48dd822a5727fc0070a2dc94a4b943e4ba867315712a2b",
+    "runs/q_learning.json": "84b6f1cae6c44a8dedbc56f8a2f3b1e68a886c7f9af709977e8fdbfed7002bba"
+  }
+}
