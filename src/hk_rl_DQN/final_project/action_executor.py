@@ -5,6 +5,7 @@ from __future__ import annotations
 import ctypes
 from ctypes import wintypes
 from dataclasses import dataclass
+import time
 from typing import Mapping, Sequence
 
 from .action_recorder import ActionRecorder, ChargeState
@@ -201,8 +202,18 @@ def find_game_window() -> int:
     return matches[0]
 
 
-def focus_game_window() -> int:
-    hwnd = find_game_window()
+def focus_game_window(timeout_s: float = 60.0) -> int:
+    deadline = time.monotonic() + timeout_s
+    while True:
+        try:
+            hwnd = find_game_window()
+            break
+        except RuntimeError:
+            if time.monotonic() >= deadline:
+                raise RuntimeError(
+                    f"Silksong window was not found within {timeout_s:g} seconds"
+                ) from None
+            time.sleep(0.25)
     user32 = ctypes.windll.user32
     user32.ShowWindow(hwnd, SW_RESTORE)
     user32.BringWindowToTop(hwnd)

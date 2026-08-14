@@ -45,9 +45,10 @@ EPSILON_START = 1.0
 EPSILON_END = 0.05
 EPSILON_DECAY_STEPS = 40_000
 GRADIENT_CLIP_NORM = 10.0
-DEFAULT_CHECKPOINT = Path("checkpoints/real_dqn.pt")
-DEFAULT_METRICS = Path("runs/real_dqn.jsonl")
-DEFAULT_ACTION_LOG = Path("runs/real_dqn_actions.jsonl")
+PROJECT_ROOT = Path(__file__).resolve().parents[2]
+DEFAULT_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "real_dqn.pt"
+DEFAULT_METRICS = PROJECT_ROOT / "runs" / "real_dqn.jsonl"
+DEFAULT_ACTION_LOG = PROJECT_ROOT / "runs" / "real_dqn_actions.jsonl"
 DEFAULT_CONTROL_TICK_MS = 100
 DEFAULT_GAME_EXE = Path(
     r"C:\Program Files (x86)\Steam\steamapps\common"
@@ -496,12 +497,21 @@ def train_live(args: argparse.Namespace) -> None:
     )
     online.train()
     target.eval()
+    process: subprocess.Popen[bytes] | None = None
+    if args.launch:
+        process = subprocess.Popen([str(args.game_exe)], cwd=str(args.game_exe.parent))
+        print(f"started Silksong pid={process.pid}; waiting for game window", flush=True)
     recorder = ActionRecorder(args.action_log)
-    executor = KeyboardActionExecutor(
-        recorder,
-        tick_ms=args.tick_ms,
-        send_input=args.execute_actions,
-    )
+    try:
+        executor = KeyboardActionExecutor(
+            recorder,
+            tick_ms=args.tick_ms,
+            send_input=args.execute_actions,
+        )
+    except Exception:
+        if process is not None and process.poll() is None and not args.keep_game:
+            process.terminate()
+        raise
     trainer = LiveTrainer(
         online,
         target,
@@ -514,12 +524,8 @@ def train_live(args: argparse.Namespace) -> None:
         learning_enabled=args.execute_actions,
     )
     tail = TelemetryTail(args.telemetry)
-    process: subprocess.Popen[bytes] | None = None
     in_arena = False
     try:
-        if args.launch:
-            process = subprocess.Popen([str(args.game_exe)], cwd=str(args.game_exe.parent))
-            print(f"started Silksong pid={process.pid}", flush=True)
         if not args.execute_actions:
             print(
                 "dry-run: actions are logged; keyboard input and learning are disabled",

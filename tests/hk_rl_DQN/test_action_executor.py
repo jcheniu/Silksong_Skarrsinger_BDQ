@@ -1,6 +1,8 @@
 from pathlib import Path
 import unittest
+from unittest.mock import patch
 
+from hk_rl_DQN.final_project import action_executor
 from hk_rl_DQN.final_project.action_executor import (
     BRANCH_SIZES,
     KeyboardActionExecutor,
@@ -15,6 +17,20 @@ from hk_rl_DQN.tools.cold_start_action_test import KEYS as COLD_START_KEYS
 
 
 class ActionExecutorTests(unittest.TestCase):
+    def test_focus_waits_for_cold_started_game_window(self) -> None:
+        with (
+            patch.object(
+                action_executor,
+                "find_game_window",
+                side_effect=[RuntimeError("not ready"), 123],
+            ),
+            patch.object(action_executor.time, "sleep") as sleep,
+            patch.object(action_executor.ctypes, "windll") as windll,
+        ):
+            self.assertEqual(action_executor.focus_game_window(timeout_s=1.0), 123)
+        sleep.assert_called_once_with(0.25)
+        windll.user32.SetForegroundWindow.assert_called_once_with(123)
+
     def test_heal_key_is_not_supported(self) -> None:
         self.assertNotIn("A", COLD_START_KEYS)
 
