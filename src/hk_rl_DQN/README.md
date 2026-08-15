@@ -78,7 +78,7 @@ ability-disable state, harpoon availability, and quick-cast availability.
 `CanHarpoonDash()` result and does not require silk;
 `spell_shift` is masked when silk is insufficient or the action is unavailable.
 
-The current reward protocol is `event-ledger-joint-action-v16`.
+The current reward protocol is `opportunity-gated-credit-v17`.
 The first 2,000 executed transitions use pure weighted exploration. Replay
 training starts at 1,000 transitions, so the network receives roughly 1,000
 gradient updates before greedy actions can influence play. After transition
@@ -91,15 +91,21 @@ total of 2-3 control ticks. Combat exploration weights tap X, hold X, Shift,
 taunt, up+X, and down+X as `30/8/8/1/20/20`, keeping taunt available without
 letting it dominate cold-start data.
 The plugin emits monotonic Boss `attack_id` events. Each completed active attack
-receives exactly one normalized joint-action budget: `+0.8` when the whole
-window is avoided and `-1.0` when it hits Hornet. The budget is distributed
-across the actions observed during that attack instead of growing with attack
-duration. Damage is credited back to recent X/S/Shift start events. Player
-damage also applies `-3.0` per lost HP across recent non-neutral combat actions
-within an eight-tick temporal window, reported as `combat_hurt_penalty`.
-X, completed charge releases, and Shift each receive
-`-0.5` if their 20-tick result window expires without Boss HP loss or a
-successful player parry. S damage trains its joint action, but an S movement
+receives one normalized joint-action budget: `+0.2` when the whole window is
+avoided and `-1.0` when it hits Hornet. Successful credit is restricted to
+combat-neutral jump, direction, and dash actions; neutral, taunt, X/Shift, and S
+cannot collect it. Failed-dodge credit remains a fixed total budget and cannot
+be avoided by standing neutral. Player damage applies one additional `-0.75`
+combat responsibility budget only to started X/Shift actions whose short
+recovery window overlapped an active Boss threat. It is not multiplied by HP.
+X, completed charge releases, and Shift receive `-0.5` only when they started
+inside a confirmed vulnerable range, completed without interruption, and their
+20-tick result window expires without Boss HP loss or a successful parry.
+The plugin's read-only `boss_vulnerable` flag comes directly from
+`HealthManager.IsInvincible`; it controls masks and credit eligibility without
+increasing the 24-value observation.
+Out-of-range attacks are hard-masked; predictive fringe attacks remain legal
+but are not treated as misses. S damage trains its joint action, but an S movement
 that deals no damage is not treated as an offensive miss. Telemetry counts
 `HeroController.NailParry()` events. A new event inside a Boss attack/combo window
 gives `+2.0` to the most recent X attack transition. The
@@ -108,8 +114,10 @@ actual action after smoothing and temporal fragments. Delayed outcomes mutate
 only a pending-credit ledger; after the 20-tick attribution horizon, an
 immutable scalar-reward transition is appended to replay. Unattributed damage
 or parry events are reported but do not reinforce the current unrelated action.
-Use `--reset` because checkpoint version 22 changes the network output and
-replay schema; older replay must not be reused.
+Greedy jump and left/right movement receive a 200-300 ms minimum commitment.
+An active/closing Boss attack, player damage, or an invalid executed action may
+break the commitment early. Use `--reset` because checkpoint version 23 changes
+reward and action semantics; checkpoint version 22 replay must not be reused.
 
 X charge is valid for a release window rather than one fixed duration. It
 becomes complete at 1,350 ms. With a 100 ms control tick, the first practical

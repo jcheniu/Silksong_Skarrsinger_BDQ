@@ -222,6 +222,7 @@ class ActionExecutorTests(unittest.TestCase):
             self.assertFalse(any("attack_x" in x["started_branches"] for x in held))
             self.assertTrue(held[-1]["charge_completed"])
             self.assertIn("attack_x", released["started_branches"])
+            self.assertTrue(released["charge_released"])
         finally:
             executor.close()
             path.unlink(missing_ok=True)

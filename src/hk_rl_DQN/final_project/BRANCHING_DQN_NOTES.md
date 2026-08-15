@@ -35,14 +35,18 @@ started, active, finished, and player-hit event counters. A completed attack
 that reached its active phase receives exactly one fixed budget:
 
 ```text
-avoided attack: +0.8 total
+eligible avoided attack: +0.2 total
 player hit:     -1.0 total
 ```
 
-The budget is normalized across eligible pending joint actions in that attack
-window, so long attacks do not create more reward merely because they produced
-more 100 ms samples. Player damage separately applies `-3.0` per lost HP across
-recent non-neutral combat actions in an eight-tick temporal window.
+The success budget is normalized only across combat-neutral jump, direction,
+and dash actions. The failure budget remains fixed across the whole attack
+window. Player damage separately applies one `-0.75` responsibility budget to
+started X/Shift actions whose short recovery overlaps an active Boss threat.
+
+Attack starts use three zones: unreachable actions are hard-masked, predictive
+fringe actions are allowed without miss punishment, and only confirmed-range,
+vulnerable, uninterrupted, completed actions can receive an offensive miss.
 
 ## Temporal Actions
 
@@ -55,5 +59,8 @@ recent non-neutral combat actions in an eight-tick temporal window.
 - Replay stores the executor's actual vector after masks and temporal locks,
   never merely the policy's attempted vector.
 
-Checkpoint version 22 and replay version 2 are incompatible with the earlier
-branching-head network and replay schema. Start those runs with `--reset`.
+Greedy jump and left/right actions are committed for 200-300 ms unless danger,
+damage, or an invalid execution requires an early break.
+
+Checkpoint version 23 is incompatible with the earlier reward and action
+semantics. Start older runs with `--reset`.

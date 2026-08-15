@@ -221,6 +221,7 @@ class StateFrame:
     scene: str
     player: Mapping[str, object] | None
     boss: Mapping[str, object] | None
+    boss_vulnerable: bool | None
     resources: PlayerResources
     control_state: str
     attack_type: str
@@ -566,6 +567,10 @@ def encode_snapshot(
     reaction = _classify_reaction(items, control_state)
     phase_event = _classify_phase_event(control_state)
     resources = decode_player_resources(snapshot)
+    raw_boss_vulnerable = snapshot.get("boss_vulnerable")
+    boss_vulnerable = (
+        raw_boss_vulnerable if isinstance(raw_boss_vulnerable, bool) else None
+    )
 
     relative_x = boss_x - player_x
     relative_y = boss_y - player_y
@@ -603,6 +608,7 @@ def encode_snapshot(
         scene=str(snapshot.get("scene") or ""),
         player=player,
         boss=boss,
+        boss_vulnerable=boss_vulnerable,
         resources=resources,
         control_state=control_state,
         attack_type=attack_type,

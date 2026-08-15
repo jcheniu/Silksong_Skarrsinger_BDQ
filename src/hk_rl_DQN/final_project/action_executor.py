@@ -18,7 +18,7 @@ BRANCH_NAMES = (
     "combat",
 )
 BRANCH_SIZES = (3, 7, 7)
-ACTION_PROTOCOL = "semantic-joint-v15-charge-protection"
+ACTION_PROTOCOL = "semantic-joint-v16-opportunity-commitment"
 BranchMasks = tuple[tuple[bool, ...], ...]
 
 KEYS = {
@@ -506,6 +506,7 @@ class KeyboardActionExecutor:
             newly_pressed_keys=newly_pressed_keys,
             started_branches=started_branches,
             adjusted_reasons=adjusted_reasons,
+            charge_released=charge_released,
             charge_pressed=values[2] == 2,
             branch_masks=masks,
             masked_reasons=masked_reasons,

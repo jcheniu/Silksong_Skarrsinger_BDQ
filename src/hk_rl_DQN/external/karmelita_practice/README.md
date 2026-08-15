@@ -38,6 +38,9 @@ Each snapshot contains the active scene, frame/timestamp, encounter status and
 player and Boss position/velocity, player health/resources, cumulative player
 `NailParry()` events, and the Boss-tree and challenge PlayMaker FSMs with their
 hierarchy path, name, and current state.
+`boss_vulnerable` is the inverse of the Boss `HealthManager.IsInvincible`
+flag. It gates new X attack starts and miss eligibility but is not added as a
+new DQN observation dimension.
 The `boss_attack` object provides a monotonic attack ID, semantic type and
 phase, cumulative start/active/finish/player-hit counters, and the most recent
 finished and player-hit IDs. The trainer uses these lifecycle events to settle

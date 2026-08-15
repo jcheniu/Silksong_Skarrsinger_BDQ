@@ -67,6 +67,7 @@ class ActionRecorder:
         newly_pressed_keys: Sequence[str] = (),
         started_branches: Sequence[str] = (),
         adjusted_reasons: Sequence[str] = (),
+        charge_released: bool = False,
     ) -> dict[str, object]:
         names = tuple(dict.fromkeys(actions))
         if not names:
@@ -112,6 +113,7 @@ class ActionRecorder:
         item["newly_pressed_keys"] = list(newly_pressed_keys)
         item["started_branches"] = list(started_branches)
         item["adjusted_reasons"] = list(adjusted_reasons)
+        item["charge_released"] = bool(charge_released)
         if branch_masks is not None:
             item["branch_masks"] = [
                 [bool(allowed) for allowed in branch] for branch in branch_masks

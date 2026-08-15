@@ -16,7 +16,7 @@ from hk_rl_DQN.real_dqn import (
     ArenaActionWatchdog,
     ArenaResetGate,
     BranchingDQN,
-    COMBAT_ACTION_HURT_PENALTY_PER_HP,
+    COMBAT_HURT_EVENT_PENALTY,
     COMBAT_EXPLORATION_WEIGHTS,
     CREDIT_FINALIZATION_STEPS,
     EVADE_FAILURE_PENALTY,
@@ -27,8 +27,11 @@ from hk_rl_DQN.real_dqn import (
     PURE_EXPLORATION_STEPS,
     ReplayBuffer,
     Transition,
+    apply_attack_opportunity_mask,
+    attack_opportunity,
     checkpoint_metadata,
     decode_joint_action,
+    danger_requires_commitment_break,
     joint_action_id,
     joint_action_mask,
     load_checkpoint,
@@ -37,7 +40,7 @@ from hk_rl_DQN.real_dqn import (
     select_action,
     validate_checkpoint,
 )
-from hk_rl_DQN.real_state import STATE_DIMENSIONS
+from hk_rl_DQN.real_state import STATE_DIMENSIONS, encode_snapshot
 from hk_rl_DQN.real_reward import ILLEGAL_ACTION_PENALTY, STEP_PENALTY
 
 
@@ -72,7 +75,8 @@ def snapshot(state: str, frame: int, health: int = 10) -> dict[str, object]:
         "player_grounded": True,
         "player": {"x": 150.0, "y": 20.0, "velocity_x": 0.0, "velocity_y": 0.0},
         "player_health": {"health": health, "max_health": 10},
-        "boss": {"x": 165.0, "y": 20.0, "velocity_x": 0.0, "velocity_y": 0.0},
+        "boss": {"x": 154.0, "y": 20.0, "velocity_x": 0.0, "velocity_y": 0.0},
+        "boss_vulnerable": True,
         "fsm": [
             {"path": "Boss Scene/Hunter Queen Boss", "name": "Control", "state": state},
             {"path": "Boss Scene/Hunter Queen Boss", "name": "Stun Control", "state": "Idle"},
@@ -323,6 +327,78 @@ class BranchingDQNTests(unittest.TestCase):
             break
         else:
             self.fail("no exploratory left/right action was selected")
+
+    def test_greedy_jump_and_direction_obey_short_commitment(self) -> None:
+        network = BranchingDQN()
+        state = ActionExplorationState()
+        with torch.no_grad():
+            for parameter in network.parameters():
+                parameter.zero_()
+            network.advantage.bias[joint_action_id((1, 1, 0))] = 10.0
+        first = select_action(
+            network,
+            (0.0,) * STATE_DIMENSIONS,
+            epsilon=0.0,
+            rng=random.Random(4),
+            device=torch.device("cpu"),
+            branch_masks=ALL_ACTIONS_AVAILABLE,
+            exploration_state=state,
+        )
+        self.assertEqual(first, (1, 1, 0))
+        with torch.no_grad():
+            network.advantage.bias.zero_()
+            network.advantage.bias[joint_action_id((0, 2, 0))] = 100.0
+        committed = select_action(
+            network,
+            (0.0,) * STATE_DIMENSIONS,
+            epsilon=0.0,
+            rng=random.Random(5),
+            device=torch.device("cpu"),
+            branch_masks=ALL_ACTIONS_AVAILABLE,
+            exploration_state=state,
+        )
+        self.assertEqual(committed[:2], (2, 1))
+
+    def test_attack_opportunity_has_confirmed_fringe_and_hard_mask_zones(self) -> None:
+        close = encode_snapshot(snapshot("Movement 1", 1))
+        self.assertTrue(attack_opportunity(close).horizontal_confirmed)
+
+        fringe_snapshot = snapshot("Movement 1", 2)
+        fringe_snapshot["boss"]["x"] = 157.2
+        fringe = attack_opportunity(encode_snapshot(fringe_snapshot))
+        self.assertTrue(fringe.horizontal_allowed)
+        self.assertFalse(fringe.horizontal_confirmed)
+
+        facing_away_snapshot = snapshot("Movement 1", 2)
+        facing_away_snapshot["player"]["facing"] = -1.0
+        facing_away = attack_opportunity(encode_snapshot(facing_away_snapshot))
+        self.assertTrue(facing_away.horizontal_allowed)
+        self.assertFalse(facing_away.horizontal_confirmed)
+
+        far_snapshot = snapshot("Movement 1", 3)
+        far_snapshot["boss"]["x"] = 165.0
+        far = attack_opportunity(encode_snapshot(far_snapshot))
+        masked, reasons = apply_attack_opportunity_mask(
+            ALL_ACTIONS_AVAILABLE,
+            far,
+            (0, 0, 0),
+        )
+        self.assertFalse(masked[2][1])
+        self.assertFalse(masked[2][2])
+        self.assertTrue(any("outside predictive range" in reason for reason in reasons))
+
+        invulnerable_snapshot = snapshot("Movement 1", 4)
+        invulnerable_snapshot["boss_vulnerable"] = False
+        invulnerable = attack_opportunity(encode_snapshot(invulnerable_snapshot))
+        self.assertFalse(invulnerable.boss_vulnerable)
+        self.assertFalse(invulnerable.horizontal_allowed)
+
+    def test_active_boss_attack_breaks_action_commitment(self) -> None:
+        self.assertTrue(
+            danger_requires_commitment_break(
+                encode_snapshot(snapshot("Slash 1", 1))
+            )
+        )
 
     def test_double_dqn_optimization_is_finite(self) -> None:
         online = BranchingDQN()
@@ -641,9 +717,9 @@ class BranchingDQNTests(unittest.TestCase):
             torch.device("cpu"),
             random.Random(1),
         )
-        neutral = (0,) * len(BRANCH_SIZES)
+        evade = (0, 1, 0)
         try:
-            with patch("hk_rl_DQN.real_dqn.select_action", return_value=neutral):
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=evade):
                 trainer.observe(snapshot("Slash Antic", 1))
                 trainer.observe(snapshot("Slash 1", 2))
                 trainer.observe(snapshot("Slash End", 3))
@@ -660,6 +736,62 @@ class BranchingDQNTests(unittest.TestCase):
                 EVADE_SUCCESS_REWARD,
             )
             self.assertGreater(trainer.metrics.movement_dodge_reward, 0.0)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_neutral_action_cannot_farm_successful_dodge_reward(self) -> None:
+        path = Path("tests/.real_dqn_neutral_dodge.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 0, 0)):
+                trainer.observe(snapshot("Slash Antic", 1))
+                trainer.observe(snapshot("Slash 1", 2))
+                trainer.observe(snapshot("Slash End", 3))
+                trainer.observe(snapshot("Movement 1", 4))
+                trainer.observe(snapshot("Movement 1", 5))
+                trainer.observe(snapshot("Movement 1", 6))
+            self.assertEqual(trainer.metrics.dodges, 1)
+            self.assertEqual(trainer.metrics.dodge_backfill_reward, 0.0)
+            self.assertEqual(trainer.metrics.unattributed_dodges, 1)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_neutral_action_still_receives_fixed_failed_dodge_budget(self) -> None:
+        path = Path("tests/.real_dqn_neutral_failed_dodge.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 0, 0)):
+                trainer.observe(snapshot("Slash Antic", 1, health=10))
+                trainer.observe(snapshot("Slash 1", 2, health=9))
+                trainer.observe(snapshot("Slash End", 3, health=9))
+                trainer.observe(snapshot("Movement 1", 4, health=9))
+                trainer.observe(snapshot("Movement 1", 5, health=9))
+                trainer.observe(snapshot("Movement 1", 6, health=9))
+            self.assertEqual(trainer.metrics.failed_dodges, 1)
+            self.assertEqual(
+                trainer.metrics.evade_failure_backfill_penalty,
+                EVADE_FAILURE_PENALTY,
+            )
         finally:
             executor.close()
             path.unlink(missing_ok=True)
@@ -752,17 +884,14 @@ class BranchingDQNTests(unittest.TestCase):
                 )
                 expected_reward = STEP_PENALTY + expected
                 if "health" in outcome:
-                    expected_reward += COMBAT_ACTION_HURT_PENALTY_PER_HP - 3.0
+                    expected_reward -= 3.0
                 self.assertAlmostEqual(
                     affected.reward,
                     expected_reward,
                 )
                 self.assertEqual(trainer.metrics.unattributed_damage_reward, 0.5 if "boss_damage_total" in outcome else 0.0)
                 if "health" in outcome:
-                    self.assertEqual(
-                        trainer.metrics.combat_hurt_penalty,
-                        COMBAT_ACTION_HURT_PENALTY_PER_HP,
-                    )
+                    self.assertEqual(trainer.metrics.combat_hurt_penalty, 0.0)
             finally:
                 executor.close()
                 path.unlink(missing_ok=True)
@@ -940,13 +1069,13 @@ class BranchingDQNTests(unittest.TestCase):
 
     def test_empty_attack_and_spell_each_penalize_combat_by_half(self) -> None:
         cases = (
-            ("attack", "normal", 1),
-            ("attack", "up", 5),
-            ("attack", "down", 6),
-            ("spell", "quick_cast", 3),
+            ("attack", "normal", 1, 154.0, 20.0, True),
+            ("attack", "up", 5, 152.0, 24.0, True),
+            ("attack", "down", 6, 152.0, 20.0, False),
+            ("spell", "quick_cast", 3, 154.0, 20.0, True),
         )
         neutral = (0,) * len(BRANCH_SIZES)
-        for action_kind, label, combat_value in cases:
+        for action_kind, label, combat_value, boss_x, boss_y, grounded in cases:
             path = Path(f"tests/.real_dqn_{label}_miss.jsonl")
             executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
             online = BranchingDQN()
@@ -971,7 +1100,13 @@ class BranchingDQNTests(unittest.TestCase):
                     ),
                 ):
                     for frame in range(1, 23):
-                        trainer.observe(snapshot("Movement 1", frame))
+                        item = snapshot("Movement 1", frame)
+                        item["player_grounded"] = grounded
+                        if not grounded:
+                            item["player"]["y"] = 24.0
+                        item["boss"]["x"] = boss_x
+                        item["boss"]["y"] = boss_y
+                        trainer.observe(item)
                 missed = next(
                     item
                     for item in trainer.replay._items
@@ -985,6 +1120,76 @@ class BranchingDQNTests(unittest.TestCase):
             finally:
                 executor.close()
                 path.unlink(missing_ok=True)
+
+    def test_fringe_or_interrupted_attack_is_not_counted_as_a_miss(self) -> None:
+        cases = ("fringe", "interrupted")
+        for case in cases:
+            path = Path(f"tests/.real_dqn_no_miss_{case}.jsonl")
+            executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+            online = BranchingDQN()
+            trainer = LiveTrainer(
+                online,
+                BranchingDQN(),
+                torch.optim.AdamW(online.parameters(), lr=1e-4),
+                executor,
+                torch.device("cpu"),
+                random.Random(1),
+            )
+            try:
+                with (
+                    patch(
+                        "hk_rl_DQN.real_dqn.branch_availability",
+                        return_value=(ALL_ACTIONS_AVAILABLE, ()),
+                    ),
+                    patch(
+                        "hk_rl_DQN.real_dqn.select_action",
+                        side_effect=[(0, 0, 1)] + [(0, 0, 0)] * 24,
+                    ),
+                ):
+                    for frame in range(1, 23):
+                        health = 9 if case == "interrupted" and frame >= 2 else 10
+                        item = snapshot("Movement 1", frame, health=health)
+                        if case == "fringe":
+                            item["boss"]["x"] = 157.2
+                        trainer.observe(item)
+                self.assertEqual(trainer.metrics.offensive_misses, 0)
+                if case == "fringe":
+                    self.assertEqual(trainer.metrics.fringe_range_attacks, 1)
+                else:
+                    self.assertEqual(trainer.metrics.confirmed_range_attacks, 1)
+            finally:
+                executor.close()
+                path.unlink(missing_ok=True)
+
+    def test_charge_release_hurt_during_recovery_is_not_a_miss(self) -> None:
+        path = Path("tests/.real_dqn_charge_recovery_interrupt.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        actions = [(0, 0, 2)] * 14 + [(0, 0, 0)] * 26
+        try:
+            with (
+                patch(
+                    "hk_rl_DQN.real_dqn.branch_availability",
+                    return_value=(ALL_ACTIONS_AVAILABLE, ()),
+                ),
+                patch("hk_rl_DQN.real_dqn.select_action", side_effect=actions),
+            ):
+                for frame in range(1, 40):
+                    health = 9 if frame >= 17 else 10
+                    trainer.observe(snapshot("Movement 1", frame, health=health))
+            self.assertEqual(trainer.metrics.confirmed_range_attacks, 1)
+            self.assertEqual(trainer.metrics.attack_misses, 0)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
 
     def test_plugin_attack_events_assign_each_fixed_budget_once(self) -> None:
         for was_hit, expected_budget in (
@@ -1079,22 +1284,53 @@ class BranchingDQNTests(unittest.TestCase):
                     side_effect=[(0, 0, 1), (0, 0, 0), (0, 0, 0), (0, 0, 0)],
                 ),
             ):
-                trainer.observe(snapshot("Movement 1", 1, health=10))
-                trainer.observe(snapshot("Movement 1", 2, health=10))
-                trainer.observe(snapshot("Movement 1", 3, health=10))
-                trainer.observe(snapshot("Movement 1", 4, health=9))
+                trainer.observe(snapshot("Slash Antic", 1, health=10))
+                trainer.observe(snapshot("Slash 1", 2, health=10))
+                trainer.observe(snapshot("Slash 2", 3, health=10))
+                trainer.observe(snapshot("Slash End", 4, health=9))
             trainer._finalize_pending(force=True)
             attack = next(
                 item for item in trainer.replay._items if item.action_vector == (0, 0, 1)
             )
             self.assertAlmostEqual(
                 attack.reward,
-                STEP_PENALTY + COMBAT_ACTION_HURT_PENALTY_PER_HP,
+                STEP_PENALTY + COMBAT_HURT_EVENT_PENALTY,
             )
             self.assertEqual(
                 trainer.metrics.combat_hurt_penalty,
-                COMBAT_ACTION_HURT_PENALTY_PER_HP,
+                COMBAT_HURT_EVENT_PENALTY,
             )
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_combat_hurt_without_active_overlap_has_no_extra_penalty(self) -> None:
+        path = Path("tests/.real_dqn_hurt_without_threat_overlap.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with (
+                patch(
+                    "hk_rl_DQN.real_dqn.branch_availability",
+                    return_value=(ALL_ACTIONS_AVAILABLE, ()),
+                ),
+                patch(
+                    "hk_rl_DQN.real_dqn.select_action",
+                    side_effect=[(0, 0, 1), (0, 0, 0), (0, 0, 0)],
+                ),
+            ):
+                trainer.observe(snapshot("Movement 1", 1, health=10))
+                trainer.observe(snapshot("Movement 1", 2, health=10))
+                trainer.observe(snapshot("Movement 1", 3, health=9))
+            self.assertEqual(trainer.metrics.combat_hurt_penalty, 0.0)
         finally:
             executor.close()
             path.unlink(missing_ok=True)

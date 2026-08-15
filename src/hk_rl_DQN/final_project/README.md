@@ -17,9 +17,14 @@ The implemented Multi-Discrete executor and joint-action DQN are recorded in
 single-action baseline is preserved under `history/simulator_dqn_v1`.
 
 Boss attacks use plugin-emitted `attack_id` lifecycle events. Each completed
-active attack distributes one fixed `+0.8` success or `-1.0` failure budget
-across its pending joint actions. Replay insertion waits for delayed credit to
+active attack distributes one fixed `+0.2` eligible-movement success or `-1.0`
+failure budget across its pending joint actions. Replay insertion waits for delayed credit to
 finish, so a sampled transition is immutable and cannot be rewritten later.
+
+X attacks use three geometric zones. Clearly unreachable actions are masked,
+predictive fringe actions remain legal without miss punishment, and only
+confirmed vulnerable-range actions can receive a completed-animation miss.
+Relative velocity predicts the Boss position 150 ms into the attack startup.
 Successful player nail clashes are read from the telemetry
 `player_parry_events` counter, not from the Boss `blocked` FSM reaction. A
 clash inside the Boss attack window gives `+2.0` to the recent X attack action

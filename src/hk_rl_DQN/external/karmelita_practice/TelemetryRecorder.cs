@@ -74,6 +74,12 @@ internal sealed class TelemetryRecorder : IDisposable
         AppendPlayerControl(json, hero);
         json.Append(",\"boss\":");
         AppendTransform(json, boss, bossBody);
+        json.Append(",\"boss_vulnerable\":");
+        json.Append(
+            observedBossHealth != null
+                ? Bool(!observedBossHealth.IsInvincible)
+                : "null"
+        );
         json.Append($",\"boss_damage_events\":{bossDamageEvents}");
         json.Append($",\"boss_damage_total\":{bossDamageTotal}");
         json.Append($",\"player_parry_events\":{plugin.PlayerParryEvents}");
