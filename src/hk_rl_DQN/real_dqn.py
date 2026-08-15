@@ -23,6 +23,7 @@ from .final_project.action_executor import (
     BranchMasks,
     KeyboardActionExecutor,
     branch_availability,
+    find_game_window,
     validate_action,
     validate_masks,
 )
@@ -31,26 +32,33 @@ from .real_reward import ILLEGAL_ACTION_PENALTY, RewardFrame, RewardTracker
 from .real_state import STATE_DIMENSIONS, StateFrame, encode_snapshot
 
 
-STATE_ENCODING = "real-telemetry-state-v3-jump-control"
+STATE_ENCODING = "real-telemetry-state-v11-semantic-24"
 ALGORITHM = "branching-dueling-double-dqn"
-CHECKPOINT_VERSION = 8
-REWARD_PROTOCOL = "attack-window-credit-taunt-silk-v6"
-HIDDEN_DIMENSIONS = (128, 128)
+CHECKPOINT_VERSION = 20
+REPLAY_CHECKPOINT_VERSION = 1
+REWARD_PROTOCOL = "three-head-harpoon-movement-v14"
+HIDDEN_DIMENSIONS = (96, 96)
 LEARNING_RATE = 1e-4
 GAMMA = 0.99
 BATCH_SIZE = 128
 REPLAY_CAPACITY = 50_000
 REPLAY_WARMUP = 1_000
 TARGET_UPDATE_INTERVAL = 500
-EPSILON_START = 1.0
-EPSILON_END = 0.05
-EPSILON_DECAY_STEPS = 40_000
+EPSILON_START = 0.60
+EPSILON_END = 0.03
+EPSILON_DECAY_STEPS = 15_000
+EXPLORATION_ACTIVATION_RATES = (0.45, 0.85, 0.30)
+MOVEMENT_EXPLORATION_WEIGHTS = (0.0, 32.0, 32.0, 12.0, 8.0, 8.0, 8.0)
 DODGE_BACKFILL_DISCOUNT = 0.9
+EVADE_FAILURE_BACKFILL_PENALTY = -0.5
 TAUNT_OUTCOME_WINDOW_STEPS = 6
 TAUNT_STEP_PENALTY = -0.02
-TAUNT_MISS_PENALTY = -0.5
+TAUNT_MISS_PENALTY = 0.0
 TAUNT_HURT_PENALTY = -1.0
+DAMAGE_CREDIT_WINDOW_STEPS = 20
+OFFENSIVE_MISS_PENALTY = -0.5
 GRADIENT_CLIP_NORM = 10.0
+BRANCH_INDEX = {name: index for index, name in enumerate(BRANCH_NAMES)}
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "real_dqn.pt"
 DEFAULT_METRICS = PROJECT_ROOT / "runs" / "real_dqn.jsonl"
@@ -107,12 +115,66 @@ class Transition:
     next_state: tuple[float, ...]
     done: bool
     next_action_masks: BranchMasks
+    branch_rewards: list[float] | None = None
+
+    def __post_init__(self) -> None:
+        if self.branch_rewards is None:
+            self.branch_rewards = [float(self.reward)] * len(BRANCH_SIZES)
+        elif len(self.branch_rewards) != len(BRANCH_SIZES):
+            raise ValueError("invalid branch reward dimensions")
+
+    def add_branch_reward(self, branch_index: int, value: float) -> None:
+        assert self.branch_rewards is not None
+        self.branch_rewards[branch_index] += value
 
 
 @dataclass
 class TauntTrial:
     transition: Transition
     remaining_steps: int = TAUNT_OUTCOME_WINDOW_STEPS
+
+
+@dataclass
+class ActionOutcomeTrial:
+    transition: Transition
+    action_kind: str
+    branch_index: int
+    penalize_miss: bool = True
+    remaining_steps: int = DAMAGE_CREDIT_WINDOW_STEPS
+    hit: bool = False
+
+
+@dataclass
+class ActionExplorationState:
+    """Short movement commitment used only for exploratory left/right actions."""
+
+    sticky_movement: int = 0
+    remaining_ticks: int = 0
+
+    def consume(self, mask: Sequence[bool]) -> int | None:
+        if self.remaining_ticks <= 0 or self.sticky_movement not in (1, 2):
+            self.clear()
+            return None
+        if not mask[self.sticky_movement]:
+            self.clear()
+            return None
+        value = self.sticky_movement
+        self.remaining_ticks -= 1
+        if self.remaining_ticks == 0:
+            self.sticky_movement = 0
+        return value
+
+    def start(self, movement: int, additional_ticks: int) -> None:
+        self.sticky_movement = movement
+        self.remaining_ticks = additional_ticks
+
+    def reconcile(self, executed_movement: int) -> None:
+        if self.sticky_movement and executed_movement != self.sticky_movement:
+            self.clear()
+
+    def clear(self) -> None:
+        self.sticky_movement = 0
+        self.remaining_ticks = 0
 
 
 class ReplayBuffer:
@@ -138,6 +200,110 @@ class ReplayBuffer:
     def __len__(self) -> int:
         return len(self._items)
 
+    def clear(self) -> None:
+        self._items.clear()
+
+    def state_dict(self) -> dict[str, object]:
+        items = list(self._items)
+        return {
+            "version": REPLAY_CHECKPOINT_VERSION,
+            "capacity": self._items.maxlen,
+            "states": torch.tensor(
+                [item.state for item in items], dtype=torch.float32
+            ).reshape(-1, STATE_DIMENSIONS),
+            "actions": torch.tensor(
+                [item.action for item in items], dtype=torch.int16
+            ).reshape(-1, len(BRANCH_SIZES)),
+            "rewards": torch.tensor(
+                [item.reward for item in items], dtype=torch.float32
+            ),
+            "next_states": torch.tensor(
+                [item.next_state for item in items], dtype=torch.float32
+            ).reshape(-1, STATE_DIMENSIONS),
+            "dones": torch.tensor([item.done for item in items], dtype=torch.bool),
+            "next_action_masks": tuple(
+                torch.tensor(
+                    [item.next_action_masks[index] for item in items],
+                    dtype=torch.bool,
+                ).reshape(-1, size)
+                for index, size in enumerate(BRANCH_SIZES)
+            ),
+            "branch_rewards": torch.tensor(
+                [item.branch_rewards for item in items], dtype=torch.float32
+            ).reshape(-1, len(BRANCH_SIZES)),
+        }
+
+    def load_state_dict(self, data: Mapping[str, object]) -> None:
+        if data.get("version") != REPLAY_CHECKPOINT_VERSION:
+            raise ValueError("checkpoint replay version mismatch")
+        if data.get("capacity") != self._items.maxlen:
+            raise ValueError("checkpoint replay capacity mismatch")
+        required = (
+            "states",
+            "actions",
+            "rewards",
+            "next_states",
+            "dones",
+            "next_action_masks",
+            "branch_rewards",
+        )
+        missing = [key for key in required if key not in data]
+        if missing:
+            raise ValueError(f"checkpoint replay fields are missing: {missing}")
+        states = torch.as_tensor(data.get("states")).cpu()
+        actions = torch.as_tensor(data.get("actions")).cpu()
+        rewards = torch.as_tensor(data.get("rewards")).cpu()
+        next_states = torch.as_tensor(data.get("next_states")).cpu()
+        dones = torch.as_tensor(data.get("dones")).cpu()
+        branch_rewards = torch.as_tensor(data.get("branch_rewards")).cpu()
+        raw_masks = data.get("next_action_masks")
+        if not isinstance(raw_masks, (tuple, list)):
+            raise ValueError("checkpoint replay masks are missing")
+        masks = tuple(torch.as_tensor(mask).cpu() for mask in raw_masks)
+        size = int(states.shape[0]) if states.ndim == 2 else -1
+        expected_shapes = (
+            states.shape == (size, STATE_DIMENSIONS),
+            actions.shape == (size, len(BRANCH_SIZES)),
+            rewards.shape == (size,),
+            next_states.shape == (size, STATE_DIMENSIONS),
+            dones.shape == (size,),
+            branch_rewards.shape == (size, len(BRANCH_SIZES)),
+            len(masks) == len(BRANCH_SIZES),
+            all(
+                mask.shape == (size, branch_size)
+                for mask, branch_size in zip(masks, BRANCH_SIZES)
+            ),
+        )
+        if not all(expected_shapes):
+            raise ValueError("checkpoint replay tensor dimensions are invalid")
+        if size > int(self._items.maxlen or 0):
+            raise ValueError("checkpoint replay exceeds configured capacity")
+        if not all(
+            torch.isfinite(values).all().item()
+            for values in (states, rewards, next_states, branch_rewards)
+        ):
+            raise ValueError("checkpoint replay contains non-finite values")
+        self.clear()
+        for index in range(size):
+            self.append(
+                Transition(
+                    state=tuple(float(value) for value in states[index].tolist()),
+                    action=tuple(int(value) for value in actions[index].tolist()),
+                    reward=float(rewards[index].item()),
+                    next_state=tuple(
+                        float(value) for value in next_states[index].tolist()
+                    ),
+                    done=bool(dones[index].item()),
+                    next_action_masks=tuple(
+                        tuple(bool(value) for value in mask[index].tolist())
+                        for mask in masks
+                    ),
+                    branch_rewards=[
+                        float(value) for value in branch_rewards[index].tolist()
+                    ],
+                )
+            )
+
 
 def epsilon_for_step(step: int) -> float:
     fraction = min(1.0, max(0, step) / EPSILON_DECAY_STEPS)
@@ -153,6 +319,7 @@ def select_action(
     rng: random.Random,
     device: torch.device,
     branch_masks: BranchMasks | None = None,
+    exploration_state: ActionExplorationState | None = None,
 ) -> tuple[int, ...]:
     if len(observation) != STATE_DIMENSIONS:
         raise ValueError(f"expected {STATE_DIMENSIONS} state values")
@@ -165,9 +332,7 @@ def select_action(
         validate_masks(branch_masks)
         if branch_masks is not None
         else tuple(
-            tuple(index == 0 for index in range(size)) if branch_index == 6
-            else tuple(True for _ in range(size))
-            for branch_index, size in enumerate(BRANCH_SIZES)
+            tuple(True for _ in range(size)) for size in BRANCH_SIZES
         )
     )
     explore = rng.random() < epsilon
@@ -177,8 +342,35 @@ def select_action(
         available = [index for index, allowed in enumerate(mask) if allowed]
         if not available:
             raise ValueError("every action branch must have an available value")
-        if explore:
-            action.append(rng.choice(available))
+        sticky_movement = (
+            exploration_state.consume(mask)
+            if branch_index == BRANCH_INDEX["movement"] and exploration_state is not None
+            else None
+        )
+        if sticky_movement is not None:
+            action.append(sticky_movement)
+        elif explore:
+            non_neutral = [index for index in available if index != 0]
+            activation_rate = EXPLORATION_ACTIVATION_RATES[branch_index]
+            if non_neutral and rng.random() < activation_rate:
+                if branch_index == BRANCH_INDEX["movement"]:
+                    total_weight = sum(
+                        MOVEMENT_EXPLORATION_WEIGHTS[index] for index in non_neutral
+                    )
+                    threshold = rng.random() * total_weight
+                    selected = non_neutral[-1]
+                    for candidate in non_neutral:
+                        threshold -= MOVEMENT_EXPLORATION_WEIGHTS[candidate]
+                        if threshold < 0:
+                            selected = candidate
+                            break
+                    action.append(selected)
+                    if exploration_state is not None and selected in (1, 2):
+                        exploration_state.start(selected, rng.choice([1, 2]))
+                else:
+                    action.append(rng.choice(non_neutral))
+            else:
+                action.append(0 if 0 in available else rng.choice(available))
         else:
             scores = branch_values.squeeze(0).clone()
             scores[torch.tensor([not allowed for allowed in mask], device=device)] = -torch.inf
@@ -197,7 +389,9 @@ def optimize_model(
         raise ValueError("transitions must not be empty")
     states = torch.tensor([item.state for item in transitions], dtype=torch.float32, device=device)
     actions = torch.tensor([item.action for item in transitions], dtype=torch.long, device=device)
-    rewards = torch.tensor([item.reward for item in transitions], dtype=torch.float32, device=device)
+    branch_rewards = torch.tensor(
+        [item.branch_rewards for item in transitions], dtype=torch.float32, device=device
+    )
     next_states = torch.tensor(
         [item.next_state for item in transitions], dtype=torch.float32, device=device
     )
@@ -210,7 +404,7 @@ def optimize_model(
             for index, branch in enumerate(online_values)
         ],
         dim=1,
-    ).mean(dim=1)
+    )
 
     with torch.no_grad():
         online_next = online(next_states)
@@ -234,7 +428,8 @@ def optimize_model(
             ],
             dim=1,
         ).mean(dim=1)
-        expected = rewards + GAMMA * next_values * (~dones)
+        immediate = branch_rewards
+        expected = immediate + GAMMA * next_values.unsqueeze(1) * (~dones).unsqueeze(1)
 
     loss = F.smooth_l1_loss(selected, expected)
     optimizer.zero_grad(set_to_none=True)
@@ -260,6 +455,8 @@ def checkpoint_metadata(
         "branch_sizes": list(BRANCH_SIZES),
         "hidden_dimensions": list(HIDDEN_DIMENSIONS),
         "control_tick_ms": control_tick_ms,
+        "replay_checkpoint_version": REPLAY_CHECKPOINT_VERSION,
+        "replay_capacity": REPLAY_CAPACITY,
         "global_step": global_step,
         "episodes": episodes,
     }
@@ -279,6 +476,8 @@ def validate_checkpoint(
         "branch_names": list(BRANCH_NAMES),
         "branch_sizes": list(BRANCH_SIZES),
         "control_tick_ms": control_tick_ms,
+        "replay_checkpoint_version": REPLAY_CHECKPOINT_VERSION,
+        "replay_capacity": REPLAY_CAPACITY,
     }
     for key, value in expected.items():
         if checkpoint.get(key) != value:
@@ -295,6 +494,7 @@ def save_checkpoint(
     global_step: int,
     episodes: int,
     control_tick_ms: int = DEFAULT_CONTROL_TICK_MS,
+    replay: ReplayBuffer | None = None,
 ) -> None:
     item = checkpoint_metadata(global_step, episodes, control_tick_ms)
     item.update(
@@ -302,10 +502,15 @@ def save_checkpoint(
             "online_state_dict": online.state_dict(),
             "target_state_dict": target.state_dict(),
             "optimizer_state_dict": optimizer.state_dict(),
+            "replay_state_dict": (
+                replay if replay is not None else ReplayBuffer()
+            ).state_dict(),
         }
     )
     path.parent.mkdir(parents=True, exist_ok=True)
-    torch.save(item, path)
+    temporary = path.with_suffix(path.suffix + ".tmp")
+    torch.save(item, temporary)
+    temporary.replace(path)
 
 
 def load_checkpoint(
@@ -316,12 +521,17 @@ def load_checkpoint(
     device: torch.device,
     reset: bool,
     control_tick_ms: int = DEFAULT_CONTROL_TICK_MS,
+    replay: ReplayBuffer | None = None,
 ) -> tuple[int, int]:
     if reset:
         target.load_state_dict(online.state_dict())
+        if replay is not None:
+            replay.clear()
         return 0, 0
     if not path.exists():
         target.load_state_dict(online.state_dict())
+        if replay is not None:
+            replay.clear()
         return 0, 0
     checkpoint = torch.load(path, map_location=device, weights_only=False)
     validate_checkpoint(checkpoint, control_tick_ms)
@@ -329,6 +539,11 @@ def load_checkpoint(
     target.load_state_dict(checkpoint.get("target_state_dict", checkpoint["online_state_dict"]))
     if "optimizer_state_dict" in checkpoint:
         optimizer.load_state_dict(checkpoint["optimizer_state_dict"])
+    if replay is not None:
+        replay_state = checkpoint.get("replay_state_dict")
+        if not isinstance(replay_state, Mapping):
+            raise ValueError("checkpoint is missing replay_state_dict")
+        replay.load_state_dict(replay_state)
     return int(checkpoint.get("global_step", 0)), int(checkpoint.get("episodes", 0))
 
 
@@ -384,10 +599,24 @@ class EpisodeMetrics:
     silk_spent: int = 0
     silk_penalty: float = 0.0
     dodge_backfill_reward: float = 0.0
+    evade_failure_backfill_penalty: float = 0.0
+    failed_dodges: int = 0
+    damage_credit_reward: float = 0.0
+    unattributed_damage_reward: float = 0.0
+    player_parries: int = 0
+    parry_reward: float = 0.0
+    parry_credit_reward: float = 0.0
+    unattributed_parry_reward: float = 0.0
+    offensive_misses: int = 0
+    attack_misses: int = 0
+    spell_misses: int = 0
+    harpoon_damage_reward: float = 0.0
+    offensive_miss_penalty: float = 0.0
     taunt_misses: int = 0
     taunt_hurts: int = 0
     taunt_penalty: float = 0.0
     dodges_by_attack: dict[str, int] = field(default_factory=dict)
+    failed_dodges_by_attack: dict[str, int] = field(default_factory=dict)
     illegal_actions: int = 0
     illegal_action_penalty: float = 0.0
 
@@ -430,6 +659,7 @@ class LiveTrainer:
         global_step: int = 0,
         episodes: int = 0,
         learning_enabled: bool = True,
+        replay: ReplayBuffer | None = None,
     ) -> None:
         self.online = online
         self.target = target
@@ -440,22 +670,22 @@ class LiveTrainer:
         self.global_step = global_step
         self.completed_episodes = episodes
         self.learning_enabled = learning_enabled
-        self.replay = ReplayBuffer()
+        self.replay = replay if replay is not None else ReplayBuffer()
         self.reward_tracker = RewardTracker()
         self.previous_state: StateFrame | None = None
         self.previous_action: tuple[int, ...] | None = None
         self.previous_illegal_penalty = 0.0
         self.previous_illegal_branches: tuple[str, ...] = ()
         self.previous_taunt_started = False
+        self.previous_started_branches: tuple[str, ...] = ()
         self.pending_attack_transitions: list[Transition] = []
         self.taunt_trials: list[TauntTrial] = []
+        self.action_outcome_trials: list[ActionOutcomeTrial] = []
+        self.action_exploration_state = ActionExplorationState()
         self.metrics = EpisodeMetrics(episode=episodes + 1)
 
     def _apply_taunt_outcomes(self, reward: RewardFrame) -> None:
         if not self.taunt_trials:
-            return
-        if reward.damage_deal > 0 and reward.player_damage_taken <= 0:
-            self.taunt_trials.clear()
             return
         remaining: list[TauntTrial] = []
         for trial in self.taunt_trials:
@@ -470,9 +700,94 @@ class LiveTrainer:
                 penalty = TAUNT_MISS_PENALTY
                 self.metrics.taunt_misses += 1
             trial.transition.reward += penalty
+            trial.transition.add_branch_reward(BRANCH_INDEX["combat"], penalty)
             self.metrics.reward += penalty
             self.metrics.taunt_penalty += penalty
         self.taunt_trials = remaining
+
+    def _register_action_outcome(self, transition: Transition) -> None:
+        action_kinds = {
+            "attack_x": ("attack", BRANCH_INDEX["combat"], True),
+            "skill_s": ("harpoon", BRANCH_INDEX["movement"], False),
+            "spell_shift": ("spell", BRANCH_INDEX["combat"], True),
+        }
+        for event_name, (action_kind, branch_index, penalize_miss) in action_kinds.items():
+            if event_name in self.previous_started_branches:
+                self.action_outcome_trials.append(
+                    ActionOutcomeTrial(
+                        transition,
+                        action_kind,
+                        branch_index,
+                        penalize_miss,
+                    )
+                )
+
+    def _penalize_offensive_miss(self, trial: ActionOutcomeTrial) -> None:
+        trial.transition.reward += OFFENSIVE_MISS_PENALTY
+        trial.transition.add_branch_reward(
+            trial.branch_index, OFFENSIVE_MISS_PENALTY
+        )
+        self.metrics.reward += OFFENSIVE_MISS_PENALTY
+        self.metrics.offensive_misses += 1
+        self.metrics.offensive_miss_penalty += OFFENSIVE_MISS_PENALTY
+        if trial.action_kind == "attack":
+            self.metrics.attack_misses += 1
+        elif trial.action_kind == "spell":
+            self.metrics.spell_misses += 1
+
+    def _apply_action_outcomes(self, transition: Transition, reward: RewardFrame) -> None:
+        if reward.damage_reward > 0:
+            if self.action_outcome_trials:
+                newest_remaining = max(
+                    trial.remaining_steps for trial in self.action_outcome_trials
+                )
+                candidates = [
+                    trial
+                    for trial in self.action_outcome_trials
+                    if trial.remaining_steps == newest_remaining
+                ]
+                share = reward.damage_reward / max(1, len(candidates))
+                for trial in candidates:
+                    trial.hit = True
+                    trial.transition.add_branch_reward(trial.branch_index, share)
+                    if trial.action_kind == "harpoon":
+                        self.metrics.harpoon_damage_reward += share
+                self.metrics.damage_credit_reward += reward.damage_reward
+            else:
+                self.metrics.unattributed_damage_reward += reward.damage_reward
+
+        if reward.parry_reward > 0:
+            attack_trials = [
+                trial
+                for trial in self.action_outcome_trials
+                if trial.action_kind == "attack"
+            ]
+            if attack_trials:
+                newest_remaining = max(
+                    trial.remaining_steps for trial in attack_trials
+                )
+                candidates = [
+                    trial
+                    for trial in attack_trials
+                    if trial.remaining_steps == newest_remaining
+                ]
+                share = reward.parry_reward / max(1, len(candidates))
+                for trial in candidates:
+                    trial.hit = True
+                    trial.transition.add_branch_reward(BRANCH_INDEX["combat"], share)
+                self.metrics.parry_credit_reward += reward.parry_reward
+            else:
+                self.metrics.unattributed_parry_reward += reward.parry_reward
+
+        remaining: list[ActionOutcomeTrial] = []
+        for trial in self.action_outcome_trials:
+            trial.remaining_steps -= 1
+            if trial.remaining_steps > 0:
+                remaining.append(trial)
+                continue
+            if not trial.hit and trial.penalize_miss:
+                self._penalize_offensive_miss(trial)
+        self.action_outcome_trials = remaining
 
     def _store_transition(
         self,
@@ -495,12 +810,41 @@ class LiveTrainer:
             return
         if reward.dodge > 0:
             for distance, item in enumerate(
-                reversed(self.pending_attack_transitions[:-1]), start=1
+                reversed(self.pending_attack_transitions)
             ):
                 bonus = reward.dodge * (DODGE_BACKFILL_DISCOUNT ** distance)
-                item.reward += bonus
-                self.metrics.reward += bonus
-                self.metrics.dodge_backfill_reward += bonus
+                for branch_index in (
+                    BRANCH_INDEX["jump_z"],
+                    BRANCH_INDEX["movement"],
+                ):
+                    item.add_branch_reward(branch_index, bonus)
+                if distance > 0:
+                    item.reward += bonus
+                    self.metrics.reward += bonus
+                    self.metrics.dodge_backfill_reward += bonus
+        elif reward.attack_hurt_player:
+            self.metrics.failed_dodges += 1
+            if reward.attack_finished is not None:
+                self.metrics.failed_dodges_by_attack[reward.attack_finished] = (
+                    self.metrics.failed_dodges_by_attack.get(
+                        reward.attack_finished, 0
+                    )
+                    + 1
+                )
+            for distance, item in enumerate(
+                reversed(self.pending_attack_transitions)
+            ):
+                penalty = EVADE_FAILURE_BACKFILL_PENALTY * (
+                    DODGE_BACKFILL_DISCOUNT ** distance
+                )
+                for branch_index in (
+                    BRANCH_INDEX["jump_z"],
+                    BRANCH_INDEX["movement"],
+                ):
+                    item.add_branch_reward(branch_index, penalty)
+                item.reward += penalty
+                self.metrics.reward += penalty
+                self.metrics.evade_failure_backfill_penalty += penalty
         for item in self.pending_attack_transitions:
             self.replay.append(item)
         self.pending_attack_transitions.clear()
@@ -513,16 +857,31 @@ class LiveTrainer:
     def _expire_taunt_trials(self) -> None:
         for trial in self.taunt_trials:
             trial.transition.reward += TAUNT_MISS_PENALTY
+            trial.transition.add_branch_reward(
+                BRANCH_INDEX["combat"], TAUNT_MISS_PENALTY
+            )
             self.metrics.reward += TAUNT_MISS_PENALTY
             self.metrics.taunt_penalty += TAUNT_MISS_PENALTY
             self.metrics.taunt_misses += 1
         self.taunt_trials.clear()
 
+    def _expire_action_outcomes(self) -> None:
+        for trial in self.action_outcome_trials:
+            if trial.hit or not trial.penalize_miss:
+                continue
+            self._penalize_offensive_miss(trial)
+        self.action_outcome_trials.clear()
+
     def observe(self, snapshot: Mapping[str, object]) -> RewardFrame:
         reward = self.reward_tracker.step(snapshot)
         if reward.player_hurt < 0:
             self.executor.release_all()
-        masks, mask_reasons = branch_availability(snapshot)
+            self.action_exploration_state.clear()
+        masks, mask_reasons = branch_availability(
+            snapshot,
+            self.executor.continuing_action,
+            harpoon_locked=self.executor.harpoon_locked,
+        )
         state = encode_snapshot(snapshot, self.executor.control_state(snapshot))
         if (
             self.learning_enabled
@@ -530,11 +889,27 @@ class LiveTrainer:
             and self.previous_action is not None
         ):
             taunt_step_penalty = (
-                TAUNT_STEP_PENALTY if self.previous_action[7] == 1 else 0.0
+                TAUNT_STEP_PENALTY if self.previous_action[2] == 4 else 0.0
             )
             transition_reward = (
                 reward.total + self.previous_illegal_penalty + taunt_step_penalty
             )
+            global_reward = (
+                reward.total
+                - reward.damage_reward
+                - reward.dodge
+                - reward.parry_reward
+                - reward.silk_penalty
+            )
+            branch_rewards = [global_reward] * len(BRANCH_SIZES)
+            branch_rewards[BRANCH_INDEX["combat"]] += (
+                reward.silk_penalty + taunt_step_penalty
+            )
+            if self.previous_illegal_penalty < 0:
+                for name in self.previous_illegal_branches:
+                    branch_index = BRANCH_INDEX.get(name)
+                    if branch_index is not None:
+                        branch_rewards[branch_index] += self.previous_illegal_penalty
             transition = Transition(
                 state=self.previous_state.observation,
                 action=self.previous_action,
@@ -542,9 +917,11 @@ class LiveTrainer:
                 next_state=state.observation,
                 done=reward.terminated,
                 next_action_masks=masks,
+                branch_rewards=branch_rewards,
             )
-            if self.previous_taunt_started:
+            if self.previous_taunt_started and not self.taunt_trials:
                 self.taunt_trials.append(TauntTrial(transition))
+            self._register_action_outcome(transition)
             self.metrics.steps += 1
             self.metrics.reward += transition_reward
             self.metrics.taunt_penalty += taunt_step_penalty
@@ -554,6 +931,8 @@ class LiveTrainer:
             self.metrics.dodges += int(reward.dodge > 0)
             self.metrics.damage_reward += reward.damage_reward
             self.metrics.dodge_reward += reward.dodge
+            self.metrics.player_parries += reward.player_parries
+            self.metrics.parry_reward += reward.parry_reward
             self.metrics.attack_range_reward += reward.entered_attack_range
             self.metrics.player_hurt_penalty += reward.player_hurt
             self.metrics.victory_reward += reward.victory
@@ -567,6 +946,7 @@ class LiveTrainer:
                     self.metrics.dodges_by_attack.get(reward.attack_finished, 0) + 1
                 )
             self._apply_taunt_outcomes(reward)
+            self._apply_action_outcomes(transition, reward)
             self._store_transition(transition, reward, state)
             self.global_step += 1
             if len(self.replay) >= REPLAY_WARMUP:
@@ -594,6 +974,7 @@ class LiveTrainer:
             self.rng,
             self.device,
             masks,
+            self.action_exploration_state,
         )
         action_result = self.executor.apply(
             action,
@@ -604,8 +985,11 @@ class LiveTrainer:
         self.previous_state = state
         executed_action = action_result.get("action_vector", action)
         self.previous_action = validate_action(executed_action)
+        self.action_exploration_state.reconcile(self.previous_action[1])
         newly_pressed = action_result.get("newly_pressed_keys", ())
         self.previous_taunt_started = "V" in newly_pressed
+        raw_started = action_result.get("started_branches", ())
+        self.previous_started_branches = tuple(str(value) for value in raw_started)
         raw_illegal_branches = action_result.get("illegal_branches", ())
         self.previous_illegal_branches = tuple(
             str(value) for value in raw_illegal_branches
@@ -617,6 +1001,7 @@ class LiveTrainer:
 
     def finish_episode(self) -> dict[str, object]:
         self._expire_taunt_trials()
+        self._expire_action_outcomes()
         self._flush_pending_transitions()
         result = self.metrics.as_dict(epsilon_for_step(self.global_step))
         self.completed_episodes += 1
@@ -627,6 +1012,8 @@ class LiveTrainer:
         self.previous_illegal_penalty = 0.0
         self.previous_illegal_branches = ()
         self.previous_taunt_started = False
+        self.previous_started_branches = ()
+        self.action_exploration_state.clear()
         self.metrics = EpisodeMetrics(episode=self.completed_episodes + 1)
         return result
 
@@ -655,9 +1042,19 @@ def train_live(args: argparse.Namespace) -> None:
         print(f"resuming checkpoint without reset: {args.checkpoint}", flush=True)
     else:
         print(f"checkpoint not found; starting new training: {args.checkpoint}", flush=True)
+    replay = ReplayBuffer()
     global_step, episodes = load_checkpoint(
-        args.checkpoint, online, target, optimizer, device, args.reset, args.tick_ms
+        args.checkpoint,
+        online,
+        target,
+        optimizer,
+        device,
+        args.reset,
+        args.tick_ms,
+        replay,
     )
+    if replay:
+        print(f"restored replay transitions: {len(replay)}", flush=True)
     online.train()
     target.eval()
     process: subprocess.Popen[bytes] | None = None
@@ -685,6 +1082,7 @@ def train_live(args: argparse.Namespace) -> None:
         global_step,
         episodes,
         learning_enabled=args.execute_actions,
+        replay=replay,
     )
     tail = TelemetryTail(args.telemetry)
     in_arena = False
@@ -718,6 +1116,7 @@ def train_live(args: argparse.Namespace) -> None:
                             trainer.global_step,
                             trainer.completed_episodes,
                             args.tick_ms,
+                            trainer.replay,
                         )
                         print(json.dumps(metric), flush=True)
                     in_arena = False
@@ -738,12 +1137,29 @@ def train_live(args: argparse.Namespace) -> None:
                         trainer.global_step,
                         trainer.completed_episodes,
                         args.tick_ms,
+                        trainer.replay,
                     )
                     print(json.dumps(metric), flush=True)
                     in_arena = False
                     reset_gate.mark_episode_finished()
             if process is not None and process.poll() is not None:
-                raise RuntimeError(f"Silksong exited with code {process.returncode}")
+                return_code = process.returncode
+                if return_code == 0:
+                    try:
+                        find_game_window()
+                    except RuntimeError:
+                        raise RuntimeError(
+                            "Silksong closed normally before the requested "
+                            f"{args.episodes} episodes completed"
+                        ) from None
+                    print(
+                        "the launched process exited with code 0, but the "
+                        "Silksong window is still running; continuing training",
+                        flush=True,
+                    )
+                    process = None
+                else:
+                    raise RuntimeError(f"Silksong exited with code {return_code}")
             if not had_data:
                 time.sleep(0.01)
     except KeyboardInterrupt:
@@ -758,6 +1174,7 @@ def train_live(args: argparse.Namespace) -> None:
             trainer.global_step,
             trainer.completed_episodes,
             args.tick_ms,
+            trainer.replay,
         )
         if process is not None and process.poll() is None and not args.keep_game:
             process.terminate()

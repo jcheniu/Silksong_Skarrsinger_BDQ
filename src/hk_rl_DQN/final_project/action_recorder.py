@@ -31,11 +31,9 @@ class ChargeState:
 
 
 class ActionRecorder:
-    # Policy boundary: DQN emits one tensor/list per control tick, for example
-    # [right=1, attack=1, jump=0, ...]. A separate real-game adapter consumes
-    # that vector and translates active entries into simultaneous key presses.
-    # This recorder stores the decoded frame only; it never makes actions
-    # mutually exclusive and it is not the keyboard adapter itself.
+    # Policy boundary: DQN emits [jump_z, movement, combat] once per control
+    # tick. The keyboard adapter executes all three selected branch values
+    # together. This recorder stores both the vector and its decoded actions.
     def __init__(self, path: str | Path) -> None:
         self.path = Path(path)
         self.path.parent.mkdir(parents=True, exist_ok=True)
@@ -57,6 +55,8 @@ class ActionRecorder:
         attempted_action_vector: Sequence[int] | None = None,
         illegal_branches: Sequence[str] = (),
         newly_pressed_keys: Sequence[str] = (),
+        started_branches: Sequence[str] = (),
+        adjusted_reasons: Sequence[str] = (),
     ) -> dict[str, object]:
         names = tuple(dict.fromkeys(actions))
         if not names:
@@ -73,7 +73,17 @@ class ActionRecorder:
             "sequence": self.sequence,
             "timestamp": time.time(),
             "actions": list(names),
-            "keys": [spec.key for spec in specs if spec.key is not None],
+            "keys": [
+                key
+                for spec in specs
+                for key in (
+                    ()
+                    if spec.key is None
+                    else spec.key
+                    if isinstance(spec.key, tuple)
+                    else (spec.key,)
+                )
+            ],
             "duration_ms": duration_ms,
             "hold": duration_ms > 75,
             "consumes_silk": any(spec.consumes_silk for spec in specs),
@@ -90,6 +100,8 @@ class ActionRecorder:
             ]
         item["illegal_branches"] = list(illegal_branches)
         item["newly_pressed_keys"] = list(newly_pressed_keys)
+        item["started_branches"] = list(started_branches)
+        item["adjusted_reasons"] = list(adjusted_reasons)
         if branch_masks is not None:
             item["branch_masks"] = [
                 [bool(allowed) for allowed in branch] for branch in branch_masks
@@ -102,7 +114,7 @@ class ActionRecorder:
         return item
 
     def record(self, action: str, duration_ms: int | None = None, note: str = "") -> dict[str, object]:
-        """Compatibility wrapper: a legacy single action is one independent frame."""
+        """Compatibility wrapper for recording one atomic action."""
         spec = get_action(action)
         duration = spec.min_hold_ms if duration_ms is None else duration_ms
         if duration < spec.min_hold_ms:

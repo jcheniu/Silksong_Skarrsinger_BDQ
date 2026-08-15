@@ -75,6 +75,7 @@ internal sealed class TelemetryRecorder : IDisposable
         AppendTransform(json, boss, bossBody);
         json.Append($",\"boss_damage_events\":{bossDamageEvents}");
         json.Append($",\"boss_damage_total\":{bossDamageTotal}");
+        json.Append($",\"player_parry_events\":{plugin.PlayerParryEvents}");
         json.Append(",\"fsm\":[");
         bool first = true;
         foreach (PlayMakerFSM fsm in Resources.FindObjectsOfTypeAll<PlayMakerFSM>())
@@ -163,11 +164,11 @@ internal sealed class TelemetryRecorder : IDisposable
             json.Append("null");
             return;
         }
-        json.Append($"{{\"jump_available\":{Bool(hero.CanJump())}");
-        json.Append($",\"double_jump_available\":{Bool(hero.CanDoubleJump(false))}");
+        bool jumpAvailable = hero.CanJump();
+        bool doubleJumpAvailable = hero.CanDoubleJump(false);
+        json.Append($"{{\"jump_available\":{Bool(jumpAvailable)}");
+        json.Append($",\"double_jump_available\":{Bool(doubleJumpAvailable)}");
         json.Append($",\"dash_available\":{Bool(hero.CanDash())}");
-        json.Append($",\"sprint_available\":{Bool(hero.CanSprint())}");
-        json.Append($",\"sprinting\":{Bool(hero.cState.isSprinting || hero.cState.isBackSprinting)}");
         json.Append($",\"attack_available\":{Bool(hero.CanAttack())}}}");
     }
 
@@ -180,7 +181,8 @@ internal sealed class TelemetryRecorder : IDisposable
         }
         Vector3 position = transform.position;
         Vector2 velocity = body != null ? body.linearVelocity : Vector2.zero;
-        json.Append($"{{\"x\":{Number(position.x)},\"y\":{Number(position.y)},\"z\":{Number(position.z)},\"velocity_x\":{Number(velocity.x)},\"velocity_y\":{Number(velocity.y)}}}");
+        float facing = Mathf.Sign(transform.localScale.x);
+        json.Append($"{{\"x\":{Number(position.x)},\"y\":{Number(position.y)},\"z\":{Number(position.z)},\"velocity_x\":{Number(velocity.x)},\"velocity_y\":{Number(velocity.y)},\"facing\":{Number(facing)}}}");
     }
 
     private static string Number(float value) => value.ToString("R", CultureInfo.InvariantCulture);

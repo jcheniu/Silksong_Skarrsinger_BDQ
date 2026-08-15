@@ -13,22 +13,19 @@ from ..real_state import KeyHoldState, PlayerResources, decode_player_resources
 
 
 BRANCH_NAMES = (
-    "horizontal",
     "jump_z",
-    "dash_c",
-    "attack_x",
-    "skill_s",
-    "spell_shift",
-    "dream_d",
-    "taunt_v",
+    "movement",
+    "combat",
 )
-BRANCH_SIZES = (3, 4, 3, 3, 2, 2, 2, 2)
-ACTION_PROTOCOL = "branching-key-state-v5-executed-fragments"
+BRANCH_SIZES = (3, 7, 7)
+ACTION_PROTOCOL = "semantic-bdq-v13-harpoon-lock"
 BranchMasks = tuple[tuple[bool, ...], ...]
 
 KEYS = {
     "LeftArrow": (0x4B, True),
     "RightArrow": (0x4D, True),
+    "UpArrow": (0x48, True),
+    "DownArrow": (0x50, True),
     "Z": (0x2C, False),
     "C": (0x2E, False),
     "X": (0x2D, False),
@@ -101,19 +98,30 @@ def validate_masks(masks: Sequence[Sequence[bool]]) -> BranchMasks:
     return values
 
 
-def branch_availability(snapshot: Mapping[str, object]) -> tuple[BranchMasks, tuple[str, ...]]:
+def branch_availability(
+    snapshot: Mapping[str, object],
+    continuing_action: Sequence[int] | None = None,
+    harpoon_locked: bool = False,
+) -> tuple[BranchMasks, tuple[str, ...]]:
     """Build conservative branch masks from optional resource/control telemetry."""
 
     masks = [[True] * size for size in BRANCH_SIZES]
+    continuing = (
+        validate_action(continuing_action)
+        if continuing_action is not None
+        else (0,) * len(BRANCH_SIZES)
+    )
     reasons: list[str] = []
-    masks[6][1] = False
-    reasons.append("dream_d disabled by policy")
     resources = decode_player_resources(snapshot)
+    if harpoon_locked:
+        masks = [[index == 0 for index in range(size)] for size in BRANCH_SIZES]
+        reasons.append("all branches masked: harpoon active/recovery lock")
+        return validate_masks(masks), tuple(reasons)
     if not resources.can_harpoon_dash:
-        masks[4][1] = False
-        reasons.append("skill_s held masked: CanHarpoonDash is false or unavailable")
+        masks[1][6] = False
+        reasons.append("movement harpoon masked: CanHarpoonDash is false or unavailable")
     if not resources.can_quick_cast:
-        masks[5][1] = False
+        masks[2][3] = False
         if not resources.is_complete:
             reasons.append("spell_shift held masked: player resource telemetry is incomplete")
         elif resources.silk_abilities_disabled:
@@ -131,41 +139,43 @@ def branch_availability(snapshot: Mapping[str, object]) -> tuple[BranchMasks, tu
 
     controls = snapshot.get("player_control")
     control_values = controls if isinstance(controls, Mapping) else {}
-    mobility_controls = (
-        (1, (1, 2), "jump_available", "jump"),
-        (1, (3,), "double_jump_available", "double_jump"),
-        (2, (1,), "dash_available", "dash"),
-        (3, (1, 2), "attack_available", "attack"),
-    )
-    for branch_index, values, field, action_name in mobility_controls:
-        if control_values.get(field) is not True:
-            for value in values:
-                masks[branch_index][value] = False
-            reasons.append(f"{action_name} masked: {field} is false or unavailable")
-    sprint_available = control_values.get("sprint_available") is True
-    sprinting = control_values.get("sprinting") is True
-    if snapshot.get("player_grounded") is not True or not (sprint_available or sprinting):
-        masks[2][2] = False
-        reasons.append("sprint masked: grounded sprint is unavailable")
+    dash_available = control_values.get("dash_available") is True
+    for value in (3, 4, 5):
+        masks[1][value] = dash_available
+    if not dash_available:
+        reasons.append("dash masked: dash_available is false or unavailable")
+    attack_available = control_values.get("attack_available") is True
+    for value in (1, 5, 6):
+        masks[2][value] = attack_available
+    masks[2][2] = attack_available or continuing[2] == 2
+    if not attack_available:
+        reasons.append("attack start masked: attack_available is false or unavailable")
     return validate_masks(masks), tuple(reasons)
 
 
 def action_keys(action: Sequence[int]) -> tuple[str, ...]:
     values = validate_action(action)
     keys: list[str] = []
-    if values[0] == 1:
-        keys.append("LeftArrow")
-    elif values[0] == 2:
-        keys.append("RightArrow")
-    if values[1]:
+    if values[0]:
         keys.append("Z")
-    if values[2]:
+    if values[1] in (1, 4):
+        keys.append("LeftArrow")
+    elif values[1] in (2, 5):
+        keys.append("RightArrow")
+    if values[1] in (3, 4, 5):
         keys.append("C")
-    if values[3]:
+    elif values[1] == 6:
+        keys.append("S")
+    if values[2] in (1, 2):
         keys.append("X")
-    for enabled, key in zip(values[4:], ("S", "LeftShift", None, "V")):
-        if enabled and key is not None:
-            keys.append(key)
+    elif values[2] == 5:
+        keys.extend(("UpArrow", "X"))
+    elif values[2] == 6:
+        keys.extend(("DownArrow", "X"))
+    elif values[2] == 3:
+        keys.append("LeftShift")
+    elif values[2] == 4:
+        keys.append("V")
     return tuple(keys)
 
 
@@ -173,29 +183,33 @@ def decode_actions(action: Sequence[int]) -> tuple[str, ...]:
     values = validate_action(action)
     names: list[str] = []
     if values[0] == 1:
-        names.append("left")
-    elif values[0] == 2:
-        names.append("right")
-    if values[1] == 1:
         names.append("jump")
-    elif values[1] == 2:
+    elif values[0] == 2:
         names.append("jump_hold")
+    if values[1] == 1:
+        names.append("left")
+    elif values[1] == 2:
+        names.append("right")
     elif values[1] == 3:
-        names.append("double_jump")
-    if values[2] == 1:
         names.append("dash")
-    elif values[2] == 2:
-        names.append("quick_run")
-    if values[3] == 1:
+    elif values[1] == 4:
+        names.extend(("left", "dash"))
+    elif values[1] == 5:
+        names.extend(("right", "dash"))
+    elif values[1] == 6:
+        names.append("harpoon_dash")
+    if values[2] == 1:
         names.append("attack")
-    elif values[3] == 2:
+    elif values[2] == 2:
         names.append("attack_charge")
-    for enabled, name in zip(
-        values[4:],
-        ("harpoon_dash", "quick_cast", None, "taunt"),
-    ):
-        if enabled and name is not None:
-            names.append(name)
+    elif values[2] == 3:
+        names.append("quick_cast")
+    elif values[2] == 4:
+        names.append("taunt")
+    elif values[2] == 5:
+        names.append("up_attack")
+    elif values[2] == 6:
+        names.append("down_attack")
     return tuple(names or ("wait",))
 
 
@@ -262,44 +276,64 @@ class KeyboardActionExecutor:
     recorder: ActionRecorder
     tick_ms: int = 100
     send_input: bool = False
-    minimum_direction_hold_ms: int = 300
-    minimum_run_hold_ms: int = 300
+    harpoon_active_ms: int = 300
+    harpoon_lock_ms: int = 900
 
     def __post_init__(self) -> None:
         if self.tick_ms <= 0:
             raise ValueError("tick_ms must be positive")
+        if not 0 < self.harpoon_active_ms <= self.harpoon_lock_ms:
+            raise ValueError("harpoon timing must satisfy 0 < active <= lock")
         self._held_keys: set[str] = set()
         self._charge = ChargeState()
-        self._attack_hold_ms = 0
-        self._jump_hold_ms = 0
-        self._dash_hold_ms = 0
-        self._skill_hold_ms = 0
-        self._horizontal_value = 0
-        self._horizontal_hold_ms = 0
-        self._run_hold_ms = 0
-        self._jump_hold_remaining_ms = 0
-        self._jump_mode = "released"
+        self._harpoon_lock_remaining_ms = 0
+        self._last_executed = (0,) * len(BRANCH_SIZES)
         self._interrupted = False
         if self.send_input:
             focus_game_window()
 
     def control_state(self, snapshot: Mapping[str, object]) -> KeyHoldState:
-        masks, _reasons = branch_availability(snapshot)
-        return KeyHoldState(
-            jump_held="Z" in self._held_keys,
-            jump_hold_progress=self._jump_hold_ms / 350.0,
-            jump_available=masks[1][1] or masks[1][2],
-            double_jump_available=masks[1][3],
-            attack_held="X" in self._held_keys,
-            attack_hold_progress=self._attack_hold_ms / 1350.0,
-            dash_held="C" in self._held_keys,
-            dash_hold_progress=self._dash_hold_ms / 300.0,
-            skill_held="S" in self._held_keys,
-            skill_hold_progress=self._skill_hold_ms / 900.0,
-            interrupted=self._interrupted,
-            skill_available=masks[4][1],
-            spell_available=masks[5][1],
+        del snapshot
+        jump_value, movement_value, combat_value = self._last_executed
+        movement_direction = (
+            -1.0 if movement_value in (1, 4) else 1.0 if movement_value in (2, 5) else 0.0
         )
+        movement_mode = (
+            1.0 if movement_value == 6 else 0.5 if movement_value in (3, 4, 5) else 0.0
+        )
+        harpoon_elapsed_ms = (
+            self.harpoon_lock_ms - self._harpoon_lock_remaining_ms
+            if self._harpoon_lock_remaining_ms > 0
+            else 0
+        )
+        recovery_duration_ms = self.harpoon_lock_ms - self.harpoon_active_ms
+        if self._harpoon_lock_remaining_ms <= 0:
+            harpoon_phase = 0.0
+        elif harpoon_elapsed_ms < self.harpoon_active_ms:
+            harpoon_phase = 0.25
+        elif recovery_duration_ms > 0:
+            recovery_progress = (
+                harpoon_elapsed_ms - self.harpoon_active_ms
+            ) / recovery_duration_ms
+            harpoon_phase = 0.25 + 0.75 * recovery_progress
+        else:
+            harpoon_phase = 1.0
+        return KeyHoldState(
+            jump_state=jump_value / 2.0,
+            movement_direction=movement_direction,
+            movement_mode=movement_mode,
+            combat_action=combat_value / 6.0,
+            attack_charge_progress=self._charge.elapsed_ms / self._charge.required_ms,
+            harpoon_phase=harpoon_phase,
+        )
+
+    @property
+    def continuing_action(self) -> tuple[int, ...]:
+        return self._last_executed
+
+    @property
+    def harpoon_locked(self) -> bool:
+        return self._harpoon_lock_remaining_ms > 0
 
     def apply(
         self,
@@ -310,6 +344,7 @@ class KeyboardActionExecutor:
         player_resources: PlayerResources | None = None,
     ) -> dict[str, object]:
         attempted = validate_action(action)
+        charge_was_complete = self._charge.elapsed_ms >= self._charge.required_ms
         masks = validate_masks(branch_masks) if branch_masks is not None else None
         illegal_branches: tuple[str, ...] = ()
         if masks is not None:
@@ -324,74 +359,91 @@ class KeyboardActionExecutor:
             )
         else:
             values = attempted
-        values = self._smooth_mobility(values, masks, interrupted)
+        adjusted_reasons: list[str] = []
+        lock_was_active = self.harpoon_locked
+        harpoon_started = False
+        if lock_was_active:
+            if any(values):
+                adjusted_reasons.append("harpoon lock forced all branches neutral")
+            values = (0,) * len(BRANCH_SIZES)
+        else:
+            adjusted = list(values)
+            if adjusted[2] == 2 and charge_was_complete:
+                adjusted[2] = 0
+                adjusted_reasons.append("completed charge released combat branch")
+            if adjusted[1] == 6:
+                harpoon_started = True
+                if adjusted[0] != 0 or adjusted[2] != 0:
+                    adjusted_reasons.append(
+                        "harpoon launch forced jump and combat branches neutral"
+                    )
+                adjusted[0] = 0
+                adjusted[2] = 0
+            values = tuple(adjusted)
+        if interrupted:
+            if any(values):
+                adjusted_reasons.append("interruption forced all branches neutral")
+            values = (0,) * len(BRANCH_SIZES)
+            harpoon_started = False
         desired = set(action_keys(values))
         pulse_keys: set[str] = set()
 
-        # Jump intents are temporal fragments. A short jump and a double jump
-        # are pulses; a hold jump keeps Z down for a minimum launch window and
-        # can be renewed by selecting the intent on later ticks.
-        if interrupted:
-            self._jump_hold_remaining_ms = 0
-            self._jump_mode = "released"
-        elif values[1] == 1:
-            self._jump_hold_remaining_ms = 0
-            self._jump_mode = "short"
+        # The policy controls only generic Z key semantics. The same press and
+        # hold sequence may become a ground jump, double jump, or cloak hover
+        # depending entirely on the game's current state.
+        if values[0] == 1:
             pulse_keys.add("Z")
-        elif values[1] == 2:
-            self._jump_hold_remaining_ms = max(self._jump_hold_remaining_ms, 350)
-            self._jump_mode = "hold"
-        elif values[1] == 3:
-            self._jump_hold_remaining_ms = 0
-            self._jump_mode = "double"
-            pulse_keys.add("Z")
-        elif self._jump_hold_remaining_ms > 0:
-            self._jump_mode = "hold"
-        else:
-            self._jump_mode = "released"
-
-        if self._jump_hold_remaining_ms > 0:
-            desired.add("Z")
-            self._jump_hold_remaining_ms = max(0, self._jump_hold_remaining_ms - self.tick_ms)
 
         # A tap must be a real key pulse even when the policy repeats it on
         # consecutive ticks. Charge attacks deliberately remain held and are
         # tracked by ChargeState below.
-        if values[3] == 1:
+        if values[2] in (1, 5, 6):
             pulse_keys.add("X")
-        if interrupted:
-            desired.clear()
+        if values[1] in (3, 4, 5):
+            pulse_keys.add("C")
+        if values[1] == 6:
+            pulse_keys.add("S")
+        if values[2] == 3:
+            pulse_keys.add("LeftShift")
         held_before = set(self._held_keys)
         if self.send_input:
-            if values[1] in (1, 3) and "Z" in self._held_keys:
-                _send_key("Z", True)
-                self._held_keys.remove("Z")
-            if "X" in pulse_keys and "X" in self._held_keys:
-                _send_key("X", True)
-                self._held_keys.remove("X")
+            for key in sorted(pulse_keys & self._held_keys):
+                _send_key(key, True)
+                self._held_keys.remove(key)
             for key in sorted(self._held_keys - desired):
                 _send_key(key, True)
             for key in sorted(desired - self._held_keys):
                 _send_key(key, False)
         self._held_keys = desired
         self._interrupted = interrupted
-        self._jump_hold_ms = self._jump_hold_ms + self.tick_ms if "Z" in desired else 0
-        self._attack_hold_ms = self._attack_hold_ms + self.tick_ms if "X" in desired else 0
-        self._dash_hold_ms = self._dash_hold_ms + self.tick_ms if "C" in desired else 0
-        self._skill_hold_ms = self._skill_hold_ms + self.tick_ms if "S" in desired else 0
-        executed_values = list(values)
         if interrupted:
-            executed_values = [0] * len(BRANCH_SIZES)
-        elif self._jump_mode == "hold" and "Z" in desired and values[1] == 0:
-            executed_values[1] = 2
-        executed = tuple(executed_values)
+            self._harpoon_lock_remaining_ms = 0
+        elif harpoon_started:
+            self._harpoon_lock_remaining_ms = max(0, self.harpoon_lock_ms - self.tick_ms)
+        elif lock_was_active:
+            self._harpoon_lock_remaining_ms = max(
+                0, self._harpoon_lock_remaining_ms - self.tick_ms
+            )
+        executed = tuple(values)
         recorded_actions = list(decode_actions(executed))
-        newly_pressed_keys = tuple(sorted(desired - held_before))
+        newly_pressed_keys = tuple(sorted((desired - held_before) | pulse_keys))
+        started_branches: list[str] = []
+        charge_released = (
+            not interrupted and charge_was_complete and values[2] != 2
+        )
+        if values[2] in (1, 5, 6) or charge_released:
+            started_branches.append("attack_x")
+        if harpoon_started:
+            started_branches.append("skill_s")
+        if "LeftShift" in newly_pressed_keys:
+            started_branches.append("spell_shift")
+        if "V" in newly_pressed_keys:
+            started_branches.append("taunt_v")
         item = self.recorder.record_frame(
             recorded_actions,
             self.tick_ms,
             note=(
-                f"policy vector={list(attempted)} executed={list(values)} "
+                f"policy vector={list(attempted)} executed={list(executed)} "
                 f"protocol={ACTION_PROTOCOL}"
             ),
             interrupted=interrupted,
@@ -400,65 +452,25 @@ class KeyboardActionExecutor:
             attempted_action_vector=attempted,
             illegal_branches=illegal_branches,
             newly_pressed_keys=newly_pressed_keys,
-            charge_pressed=values[3] == 2,
+            started_branches=started_branches,
+            adjusted_reasons=adjusted_reasons,
+            charge_pressed=values[2] == 2,
             branch_masks=masks,
             masked_reasons=masked_reasons,
             player_resources=(
                 player_resources.as_dict() if player_resources is not None else None
             ),
         )
+        self._last_executed = executed
         return item
-
-    def _smooth_mobility(
-        self,
-        values: tuple[int, ...],
-        masks: BranchMasks | None,
-        interrupted: bool,
-    ) -> tuple[int, ...]:
-        smoothed = list(values)
-        if interrupted:
-            self._horizontal_value = 0
-            self._horizontal_hold_ms = 0
-            self._run_hold_ms = 0
-            return tuple(smoothed)
-
-        requested_horizontal = smoothed[0]
-        if self._horizontal_value == 0:
-            self._horizontal_value = requested_horizontal
-            self._horizontal_hold_ms = self.tick_ms if requested_horizontal else 0
-        elif requested_horizontal == self._horizontal_value:
-            self._horizontal_hold_ms += self.tick_ms
-        elif self._horizontal_hold_ms < self.minimum_direction_hold_ms:
-            smoothed[0] = self._horizontal_value
-            self._horizontal_hold_ms += self.tick_ms
-        else:
-            self._horizontal_value = requested_horizontal
-            self._horizontal_hold_ms = self.tick_ms if requested_horizontal else 0
-
-        run_allowed = masks is None or masks[2][2]
-        if self._run_hold_ms and run_allowed and self._run_hold_ms < self.minimum_run_hold_ms:
-            smoothed[2] = 2
-            self._run_hold_ms += self.tick_ms
-        elif smoothed[2] == 2 and run_allowed:
-            self._run_hold_ms = self._run_hold_ms + self.tick_ms if self._run_hold_ms else self.tick_ms
-        else:
-            self._run_hold_ms = 0
-        return tuple(smoothed)
 
     def release_all(self) -> None:
         if self.send_input:
             for key in sorted(self._held_keys):
                 _send_key(key, True)
         self._held_keys.clear()
-        self._attack_hold_ms = 0
-        self._jump_hold_ms = 0
-        self._dash_hold_ms = 0
-        self._skill_hold_ms = 0
-        self._horizontal_value = 0
-        self._horizontal_hold_ms = 0
-        self._run_hold_ms = 0
-        self._jump_hold_remaining_ms = 0
-        self._jump_mode = "released"
+        self._harpoon_lock_remaining_ms = 0
+        self._last_executed = (0,) * len(BRANCH_SIZES)
         self._interrupted = True
         self._charge.step(False, self.tick_ms, interrupted=True)
 

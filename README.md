@@ -6,14 +6,16 @@
 
 `src/hk_rl_DQN/` 是当前实机训练实现：
 
-- `real_state.py`：42 维状态编码，包含位置、速度、Boss FSM、反应、灵丝和按键持续状态。
+- `real_state.py`：24 维状态编码：10 维运动、1 维灵丝、7 维 Boss 语义和 6 维压缩动作状态。玩家血量不进入观察。
 - `real_reward.py`：实时奖励计算，不使用 Boss HP。
-- `final_project/action_executor.py`：8 分支同时按键、资源/FSM 合法性掩码和按键持续。
+- `final_project/action_executor.py`：3 个并行动作头、资源/FSM 合法性掩码和按键持续。
 - `real_dqn.py`：Branching Dueling Double DQN、Replay、检查点和遥测训练循环。
 - `external/karmelita_practice/`：BepInEx 遥测与 Karmelita 练习插件源码。
 - `tools/`：冷启动验收和键位检查工具。
 
-动作协议为 `[3,3,3,2,2,2,2,2]`：水平、跳跃/二段跳、冲刺/跑步、攻击、S 技能、Shift 快速施法、禁用槽、嘲讽。回血键 `A` 和梦钉键 `D` 均不会发送。
+动作协议为 `[3,7,7]`：跳跃、移动和战斗。`S` harpoon dash 位于移动头，作为高位移冲刺；攻击、Shift 快速施法和嘲讽位于战斗头。回血键 `A` 和梦钉键 `D` 均不会发送。
+
+移动探索以左右移动为主，普通/定向冲刺和 S 占较小但非零概率。探索产生的左右移动持续 2-3 个控制 tick；S 只按一个 tick，随后在主动段和后摇段内锁定其他动作。命中仍奖励 movement 头，未命中不惩罚。
 
 ## 安装与测试
 
@@ -25,11 +27,13 @@ $env:PYTHONPATH='src'
 python -m pytest -q
 ```
 
-构建 BepInEx 插件前，复制 `src/hk_rl_DQN/external/karmelita_practice/SilksongPath.props.example` 为 `SilksongPath.props`，并填写本机游戏目录。该文件被 Git 忽略，不会上传本机路径。
+构建 BepInEx 插件前，复制 `src/hk_rl_DQN/external/karmelita_practice/SilksongPath.props.example` 为 `SilksongPath.props`，并填写本机游戏目录。
 
 ## 实机训练
 
 不传 `--reset` 时，有检查点就续训，没有检查点就新建；损坏或协议不匹配的已有检查点会直接报错。只有明确传入 `--reset` 才会清零训练状态。
+
+检查点同时保存模型、优化器和 Replay Buffer。中断后再次运行会恢复历史 transition，不会重新经历空 Replay 的 1000 step 预热；`--reset` 会同时清空 Replay。
 
 ```powershell
 $env:PYTHONPATH='src'

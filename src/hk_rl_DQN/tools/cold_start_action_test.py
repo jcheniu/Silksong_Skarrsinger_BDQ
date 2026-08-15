@@ -1,163 +1,55 @@
-"""Cold-start one-action game test with live BepInEx log synchronization.
+"""Cold-start BDQ action test with live BepInEx log synchronization.
 
-This is deliberately a manual-observation tool: one process is started, one
-action is sent after the configured challenge marker, and the process remains
-open so the operator can observe the result.
+The tool accepts either a compatibility atomic action name or the exact
+[jump_z, movement, combat] vector used by live training.
 """
 
 from __future__ import annotations
 
 import argparse
-import ctypes
-from ctypes import wintypes
 import json
+import math
 import subprocess
 import time
+from collections.abc import Callable, Sequence
 from pathlib import Path
 
-from ..final_project.action_catalog import get_action
+from ..final_project.action_catalog import get_action, get_action_vector
+from ..final_project.action_executor import (
+    BRANCH_SIZES,
+    KeyboardActionExecutor,
+    validate_action,
+)
 from ..final_project.action_recorder import ActionRecorder
 
-
-KEYS = {
-    "LeftArrow": (0x25, 0x4B, True),
-    "RightArrow": (0x27, 0x4D, True),
-    "Z": (0x5A, 0x2C, False),
-    "X": (0x58, 0x2D, False),
-    "C": (0x43, 0x2E, False),
-    "S": (0x53, 0x1F, False),
-    "D": (0x44, 0x20, False),
-    "V": (0x56, 0x2F, False),
-    "LeftShift": (0xA0, 0x2A, False),
-}
-INPUT_KEYBOARD = 1
-KEYEVENTF_EXTENDEDKEY = 0x0001
-KEYEVENTF_KEYUP = 0x0002
-KEYEVENTF_SCANCODE = 0x0008
-SW_RESTORE = 9
+ALL_ACTIONS_AVAILABLE = tuple(
+    tuple(True for _ in range(size)) for size in BRANCH_SIZES
+)
 
 
-class KEYBDINPUT(ctypes.Structure):
-    _fields_ = [
-        ("wVk", wintypes.WORD),
-        ("wScan", wintypes.WORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", wintypes.WPARAM),
-    ]
+def execute_action_vector(
+    executor: KeyboardActionExecutor,
+    action: Sequence[int],
+    ticks: int,
+    sleep: Callable[[float], None] = time.sleep,
+) -> list[dict[str, object]]:
+    """Execute exactly the same fixed-tick action path used by live training."""
 
-
-class MOUSEINPUT(ctypes.Structure):
-    _fields_ = [
-        ("dx", wintypes.LONG),
-        ("dy", wintypes.LONG),
-        ("mouseData", wintypes.DWORD),
-        ("dwFlags", wintypes.DWORD),
-        ("time", wintypes.DWORD),
-        ("dwExtraInfo", wintypes.WPARAM),
-    ]
-
-
-class HARDWAREINPUT(ctypes.Structure):
-    _fields_ = [
-        ("uMsg", wintypes.DWORD),
-        ("wParamL", wintypes.WORD),
-        ("wParamH", wintypes.WORD),
-    ]
-
-
-class INPUT_UNION(ctypes.Union):
-    _fields_ = [("mi", MOUSEINPUT), ("ki", KEYBDINPUT), ("hi", HARDWAREINPUT)]
-
-
-class INPUT(ctypes.Structure):
-    _fields_ = [("type", wintypes.DWORD), ("union", INPUT_UNION)]
-
-
-def send_scan_code(scan_code: int, extended: bool, key_up: bool) -> None:
-    flags = KEYEVENTF_SCANCODE
-    if extended:
-        flags |= KEYEVENTF_EXTENDEDKEY
-    if key_up:
-        flags |= KEYEVENTF_KEYUP
-    item = INPUT(type=INPUT_KEYBOARD, union=INPUT_UNION(ki=KEYBDINPUT(0, scan_code, flags, 0, 0)))
-    sent = ctypes.windll.user32.SendInput(1, ctypes.byref(item), ctypes.sizeof(INPUT))
-    if sent != 1:
-        raise ctypes.WinError()
-
-
-def find_game_window() -> int:
-    user32 = ctypes.windll.user32
-    matches: list[int] = []
-    callback_type = ctypes.WINFUNCTYPE(wintypes.BOOL, wintypes.HWND, wintypes.LPARAM)
-
-    def visit(hwnd: int, _lparam: int) -> bool:
-        if not user32.IsWindowVisible(hwnd):
-            return True
-        length = user32.GetWindowTextLengthW(hwnd)
-        if length <= 0:
-            return True
-        title = ctypes.create_unicode_buffer(length + 1)
-        user32.GetWindowTextW(hwnd, title, length + 1)
-        if "Hollow Knight Silksong" in title.value:
-            matches.append(hwnd)
-        return True
-
-    callback = callback_type(visit)
-    user32.EnumWindows(callback, 0)
-    if not matches:
-        raise RuntimeError("Silksong window was not found")
-    return matches[0]
-
-
-def focus_game_window(timeout_s: float = 5.0) -> int:
-    user32 = ctypes.windll.user32
-    hwnd = find_game_window()
-    user32.ShowWindow(hwnd, SW_RESTORE)
-    user32.BringWindowToTop(hwnd)
-    user32.SetForegroundWindow(hwnd)
-    deadline = time.monotonic() + timeout_s
-    while time.monotonic() < deadline:
-        if user32.GetForegroundWindow() == hwnd:
-            time.sleep(0.25)
-            return hwnd
-        user32.SetForegroundWindow(hwnd)
-        time.sleep(0.1)
-    raise RuntimeError("Silksong window could not be focused; refusing to send input")
-
-
-def send_key(key: str, duration_ms: int) -> int:
-    if key == "Z+direction":
-        hwnd = focus_game_window()
-        _send_key_down("RightArrow")
-        try:
-            _send_key_down("Z")
-            time.sleep(duration_ms / 1000.0)
-        finally:
-            _send_key_up("Z")
-            _send_key_up("RightArrow")
-        return hwnd
-    if key not in KEYS:
-        raise ValueError(f"unsupported test key: {key}")
-    user32 = ctypes.windll.user32
-    hwnd = focus_game_window()
-    _vk, scan_code, extended = KEYS[key]
-    _send_key_down(key)
+    values = validate_action(action)
+    if ticks <= 0:
+        raise ValueError("ticks must be positive")
+    frames: list[dict[str, object]] = []
     try:
-        time.sleep(duration_ms / 1000.0)
+        for _ in range(ticks):
+            frames.append(
+                executor.apply(values, branch_masks=ALL_ACTIONS_AVAILABLE)
+            )
+            sleep(executor.tick_ms / 1000.0)
     finally:
-        _send_key_up(key)
-    return hwnd
-
-
-def _send_key_down(key: str) -> None:
-    _vk, scan_code, extended = KEYS[key]
-    send_scan_code(scan_code, extended, False)
-
-
-def _send_key_up(key: str) -> None:
-    _vk, scan_code, extended = KEYS[key]
-    send_scan_code(scan_code, extended, True)
+        frames.append(
+            executor.apply((0, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+        )
+    return frames
 
 
 def wait_after_hit_settle(seconds: float) -> None:
@@ -197,7 +89,15 @@ def wait_for_marker(log_path: Path, marker: str, timeout_s: float) -> str:
 
 def main() -> None:
     parser = argparse.ArgumentParser()
-    parser.add_argument("action")
+    parser.add_argument("action", nargs="?")
+    parser.add_argument(
+        "--action-vector",
+        nargs=3,
+        type=int,
+        metavar=("JUMP_Z", "MOVEMENT", "COMBAT"),
+    )
+    parser.add_argument("--ticks", type=int)
+    parser.add_argument("--tick-ms", type=int, default=100)
     parser.add_argument("--duration-ms", type=int)
     parser.add_argument("--game-exe", type=Path, required=True)
     parser.add_argument("--log", type=Path, required=True)
@@ -214,9 +114,31 @@ def main() -> None:
     parser.add_argument("--post-hit-settle-s", type=float, default=0.0)
     args = parser.parse_args()
 
-    spec = get_action(args.action)
-    duration_ms = spec.min_hold_ms if args.duration_ms is None else args.duration_ms
+    if (args.action is None) == (args.action_vector is None):
+        parser.error("provide either an atomic action or --action-vector")
+    if args.tick_ms <= 0:
+        parser.error("--tick-ms must be positive")
+    if args.ticks is not None and args.ticks <= 0:
+        parser.error("--ticks must be positive")
+    if args.action_vector is not None:
+        if args.duration_ms is not None:
+            parser.error("--duration-ms is only valid with an atomic action")
+        action_vector = validate_action(args.action_vector)
+        ticks = args.ticks or 1
+        label = "vector_" + "_".join(str(value) for value in action_vector)
+    else:
+        assert args.action is not None
+        if args.ticks is not None and args.duration_ms is not None:
+            parser.error("use either --ticks or --duration-ms, not both")
+        spec = get_action(args.action)
+        action_vector = get_action_vector(args.action)
+        duration_ms = spec.min_hold_ms if args.duration_ms is None else args.duration_ms
+        if duration_ms < spec.min_hold_ms:
+            parser.error(f"{args.action} requires at least {spec.min_hold_ms} ms")
+        ticks = args.ticks or max(1, math.ceil(duration_ms / args.tick_ms))
+        label = args.action
     recorder = ActionRecorder(args.output)
+    executor: KeyboardActionExecutor | None = None
     try:
         if not args.no_launch:
             subprocess.Popen([str(args.game_exe)], cwd=str(args.game_exe.parent))
@@ -232,23 +154,24 @@ def main() -> None:
         else:
             trigger_line = wait_for_marker(args.log, args.intent_marker, args.timeout_s)
             print(f"Matched boss intent: {trigger_line}")
-        if spec.key is None:
-            command = recorder.record(args.action, duration_ms, note=f"after marker: {args.marker}")
-            print(json.dumps(command, ensure_ascii=True))
-            print("wait action: no key sent")
-        else:
-            sent_hwnd = send_key(spec.key, duration_ms)
-            command = recorder.record(
-                args.action,
-                duration_ms,
-                note=f"sent successfully after marker: {args.marker}; focused_hwnd={sent_hwnd}",
-            )
-            print(json.dumps(command, ensure_ascii=True))
-            print(f"Sent {spec.key} for {duration_ms} ms to Silksong hwnd={sent_hwnd}; observe the game now.")
+        executor = KeyboardActionExecutor(
+            recorder,
+            tick_ms=args.tick_ms,
+            send_input=True,
+        )
+        frames = execute_action_vector(executor, action_vector, ticks)
+        print(json.dumps(frames, ensure_ascii=True))
+        print(
+            f"Executed {label}: vector={list(action_vector)}, ticks={ticks}, "
+            f"tick_ms={args.tick_ms}; observe the game now."
+        )
         time.sleep(args.observe_s)
         print(f"Observation window complete: {args.observe_s:.1f}s")
     finally:
-        recorder.close()
+        if executor is not None:
+            executor.close()
+        else:
+            recorder.close()
 
 
 if __name__ == "__main__":

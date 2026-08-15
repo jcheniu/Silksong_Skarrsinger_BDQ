@@ -34,8 +34,9 @@ file is:
 `BepInEx/plugins/hollow-knight-rl-KarmelitaPractice/telemetry.jsonl`
 
 Each snapshot contains the active scene, frame/timestamp, encounter status,
-player and Boss position/velocity, player health/resources, and the Boss-tree and
-challenge PlayMaker FSMs with their hierarchy path, name, and current state.
+player and Boss position/velocity, player health/resources, cumulative player
+`NailParry()` events, and the Boss-tree and challenge PlayMaker FSMs with their
+hierarchy path, name, and current state.
 Sampling defaults to 100 ms. The settings are generated in the plugin config:
 
 ```json

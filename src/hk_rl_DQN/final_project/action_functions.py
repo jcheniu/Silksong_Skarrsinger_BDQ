@@ -1,4 +1,4 @@
-"""Callable combat actions for the final real-game test adapter."""
+"""Callable atomic actions for the final real-game test adapter."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ def _send(recorder: ActionRecorder, name: str, duration_ms: int | None = None) -
 
 def frame(recorder: ActionRecorder, actions: list[str], duration_ms: int = 50,
           interrupted: bool = False) -> dict[str, Any]:
-    """Emit one decoded tensor/list frame; each listed intent is independent."""
+    """Record decoded action names for one composed control frame."""
     return recorder.record_frame(actions, duration_ms, note="composed control frame",
                                  interrupted=interrupted)
 
@@ -40,23 +40,23 @@ def jump(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, 
 
 
 def jump_hold(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
-    return _send(recorder, "jump_hold", duration_ms or 350)
-
-
-def double_jump(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
-    return _send(recorder, "double_jump", duration_ms or 80)
+    return _send(recorder, "jump_hold", duration_ms or 100)
 
 
 def dash(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
     return _send(recorder, "dash", duration_ms or 80)
 
 
-def quick_run(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
-    return _send(recorder, "quick_run", duration_ms or 600)
-
-
 def attack(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
     return _send(recorder, "attack", duration_ms or 80)
+
+
+def up_attack(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
+    return _send(recorder, "up_attack", duration_ms or 80)
+
+
+def down_attack(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
+    return _send(recorder, "down_attack", duration_ms or 80)
 
 
 def attack_charge(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:

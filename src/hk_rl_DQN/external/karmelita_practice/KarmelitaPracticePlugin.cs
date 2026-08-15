@@ -13,6 +13,8 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
 {
     private const int SaveSlot = 1;
     private const float StartupDelaySeconds = 8f;
+    private const int SaveLoadAttempts = 3;
+    private const float SaveLoadRetryDelaySeconds = 3f;
     private const float ManagerTimeoutSeconds = 30f;
     private const float SaveLoadTimeoutSeconds = 90f;
     private const float SceneLoadTimeoutSeconds = 30f;
@@ -46,12 +48,27 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
     private float safeHeroY = KarmelitaEncounter.FallbackHeroY;
     private readonly Dictionary<string, string> bossFsmStates = new();
     private int observedHeroHealth = -1;
+    private long playerParryEvents;
     private Vector3 observedHeroPosition;
     private bool observedHeroPositionValid;
 
     internal static KarmelitaPracticePlugin? Instance { get; private set; }
     internal bool IsEncounterActive => encounterActive && !isTransitioning;
     internal Transform? ActiveBoss { get; private set; }
+    internal long PlayerParryEvents => playerParryEvents;
+
+    internal void RecordPlayerParry(HeroController hero)
+    {
+        if (
+            IsEncounterActive
+            && ReferenceEquals(hero, HeroController.instance)
+            && SceneManager.GetActiveScene().name == KarmelitaEncounter.SceneName
+        )
+        {
+            playerParryEvents++;
+            Logger.LogInfo($"Karmelita player parry: {playerParryEvents}");
+        }
+    }
 
     private void Awake()
     {
@@ -87,6 +104,7 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
         Logger.LogInfo("Karmelita practice loop ready");
         harmony = new Harmony("io.github.hollow-knight-rl.karmelita-practice");
         harmony.PatchAll(typeof(KarmelitaScenePatches).Assembly);
+        isTransitioning = true;
         StartCoroutine(AutoEnterArena());
     }
 
@@ -97,7 +115,10 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
             return;
         }
 
-        telemetry?.Tick(this);
+        if (encounterActive)
+        {
+            telemetry?.Tick(this);
+        }
 
         if (Input.GetKeyDown(KeyCode.F8))
         {
@@ -129,31 +150,54 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
 
         if (GameManager.instance == null)
         {
+            isTransitioning = false;
+            showLoadingCurtain = false;
             Logger.LogError("Automatic entry stopped: GameManager did not become ready");
             yield break;
         }
 
-        isTransitioning = true;
         showLoadingCurtain = true;
-        Logger.LogInfo($"Automatically loading save slot {SaveSlot}");
-        GameManager.instance.LoadGame(
-            SaveSlot,
-            succeeded =>
-            {
-                saveLoadSucceeded = succeeded;
-                saveLoadCompleted = true;
-            }
-        );
-
-        deadline = Time.realtimeSinceStartup + SaveLoadTimeoutSeconds;
-        while (!saveLoadCompleted && Time.realtimeSinceStartup < deadline)
+        for (int attempt = 1; attempt <= SaveLoadAttempts; attempt++)
         {
-            yield return null;
+            saveLoadCompleted = false;
+            saveLoadSucceeded = false;
+            Logger.LogInfo(
+                $"Automatically loading save slot {SaveSlot} "
+                + $"(attempt {attempt}/{SaveLoadAttempts})"
+            );
+            GameManager.instance.LoadGame(
+                SaveSlot,
+                succeeded =>
+                {
+                    saveLoadSucceeded = succeeded;
+                    saveLoadCompleted = true;
+                }
+            );
+
+            deadline = Time.realtimeSinceStartup + SaveLoadTimeoutSeconds;
+            while (!saveLoadCompleted && Time.realtimeSinceStartup < deadline)
+            {
+                yield return null;
+            }
+
+            if (saveLoadCompleted && saveLoadSucceeded)
+            {
+                break;
+            }
+
+            Logger.LogWarning(
+                $"Save slot {SaveSlot} load attempt {attempt} failed"
+            );
+            if (attempt < SaveLoadAttempts)
+            {
+                yield return new WaitForSecondsRealtime(SaveLoadRetryDelaySeconds);
+            }
         }
 
         if (!saveLoadCompleted || !saveLoadSucceeded)
         {
             isTransitioning = false;
+            showLoadingCurtain = false;
             Logger.LogError($"Automatic entry stopped: save slot {SaveSlot} could not be read");
             yield break;
         }

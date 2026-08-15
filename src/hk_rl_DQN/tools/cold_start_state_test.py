@@ -21,12 +21,10 @@ import time
 from typing import Any
 
 from ..real_state import (
-    ATTACK_PHASES,
-    ATTACK_TYPES,
+    BOSS_SEMANTIC_DIMENSIONS,
+    BOSS_SEMANTIC_FEATURES,
     KINEMATIC_STATE_DIMENSIONS,
     RESOURCE_STATE_DIMENSIONS,
-    PHASE_EVENTS,
-    REACTIONS,
     STATE_DIMENSIONS,
     encode_snapshot,
 )
@@ -102,13 +100,9 @@ class AppendedJsonl:
         return rows
 
 
-def _one_hot_slices(observation: tuple[float, ...]) -> tuple[tuple[float, ...], ...]:
+def _boss_semantic_slice(observation: tuple[float, ...]) -> tuple[float, ...]:
     offset = KINEMATIC_STATE_DIMENSIONS + RESOURCE_STATE_DIMENSIONS
-    groups = []
-    for size in (len(ATTACK_TYPES), len(ATTACK_PHASES), len(REACTIONS), len(PHASE_EVENTS)):
-        groups.append(observation[offset : offset + size])
-        offset += size
-    return tuple(groups)
+    return observation[offset : offset + BOSS_SEMANTIC_DIMENSIONS]
 
 
 def _validate_snapshot(
@@ -163,9 +157,9 @@ def _validate_snapshot(
         errors.append(f"frame {state.frame}: dimension {len(state.observation)} != {STATE_DIMENSIONS}")
     if any(not math.isfinite(value) or not -1.0 <= value <= 1.0 for value in state.observation):
         errors.append(f"frame {state.frame}: observation contains non-finite or out-of-range values")
-    for group in _one_hot_slices(state.observation):
-        if not math.isclose(sum(group), 1.0, abs_tol=1e-7):
-            errors.append(f"frame {state.frame}: invalid one-hot group {group}")
+    semantics = _boss_semantic_slice(state.observation)
+    if len(semantics) != len(BOSS_SEMANTIC_FEATURES):
+        errors.append(f"frame {state.frame}: invalid Boss semantic feature count")
     if not state.control_state:
         errors.append(f"frame {state.frame}: Boss Control FSM is missing or inactive")
     lowered = state.control_state.lower()

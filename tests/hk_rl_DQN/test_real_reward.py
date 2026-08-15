@@ -6,6 +6,7 @@ from hk_rl_DQN.real_reward import (
     DODGE_REWARD,
     PLAYER_HURT_PENALTY,
     PLAYER_DAMAGE_PENALTY_PER_HP,
+    PLAYER_PARRY_REWARD,
     STEP_PENALTY,
     SILK_SPEND_PENALTY_PER_UNIT,
     VICTORY_REWARD,
@@ -24,6 +25,8 @@ def snapshot(
     boss_damage_events: int | None = None,
     boss_damage_total: int | None = None,
     silk: int | None = None,
+    timestamp: float = 1.0,
+    player_parry_events: int | None = None,
 ) -> dict[str, object]:
     fsms = [
         {"path": "Boss Scene/Hunter Queen Boss", "name": "Control", "state": state},
@@ -39,7 +42,7 @@ def snapshot(
         )
     result = {
         "type": "snapshot",
-        "timestamp": 1.0,
+        "timestamp": timestamp,
         "frame": 60,
         "scene": "Memory_Ant_Queen",
         "player_grounded": True,
@@ -62,6 +65,8 @@ def snapshot(
             "skill_available": True,
             "spell_available": True,
         }
+    if player_parry_events is not None:
+        result["player_parry_events"] = player_parry_events
     return result
 
 
@@ -89,28 +94,71 @@ class RewardTrackerTests(unittest.TestCase):
 
     def test_completed_attack_without_health_loss_rewards_dodge(self) -> None:
         tracker = RewardTracker()
-        tracker.step(snapshot("Slash Antic"))
-        held_antic = tracker.step(snapshot("Slash Antic"))
+        tracker.step(snapshot("Slash Antic", timestamp=1.0))
+        held_antic = tracker.step(snapshot("Slash Antic", timestamp=1.1))
         self.assertEqual(held_antic.dodge, 0.0)
-        tracker.step(snapshot("Slash 3"))
-        reward = tracker.step(snapshot("Slash End"))
+        tracker.step(snapshot("Slash 3", timestamp=1.2))
+        reward = tracker.step(snapshot("Slash End", timestamp=1.3))
         self.assertEqual(reward.dodge, 0.0)
-        reward = tracker.step(snapshot("Movement 1"))
+        tracker.step(snapshot("Movement 1", timestamp=1.4))
+        reward = tracker.step(snapshot("Movement 1", timestamp=1.6))
         self.assertEqual(reward.attack_finished, "slash")
         self.assertEqual(reward.dodge, DODGE_REWARD)
+        self.assertFalse(reward.attack_hurt_player)
 
     def test_hurt_during_attack_cancels_dodge(self) -> None:
         tracker = RewardTracker()
-        tracker.step(snapshot("Throw Antic", health=10))
-        tracker.step(snapshot("Throw 1", health=9))
-        reward = tracker.step(snapshot("Movement 1", health=9))
+        tracker.step(snapshot("Throw Antic", health=10, timestamp=1.0))
+        tracker.step(snapshot("Throw 1", health=9, timestamp=1.1))
+        tracker.step(snapshot("Movement 1", health=9, timestamp=1.2))
+        reward = tracker.step(snapshot("Movement 1", health=9, timestamp=1.4))
         self.assertEqual(reward.dodge, 0.0)
+        self.assertTrue(reward.attack_hurt_player)
+
+    def test_player_parry_during_boss_attack_rewards_two(self) -> None:
+        tracker = RewardTracker()
+        tracker.step(
+            snapshot("Slash Antic", timestamp=1.0, player_parry_events=0)
+        )
+        reward = tracker.step(
+            snapshot("Slash 1", timestamp=1.1, player_parry_events=1)
+        )
+        self.assertEqual(reward.player_parries, 1)
+        self.assertEqual(reward.parry_reward, PLAYER_PARRY_REWARD)
+
+    def test_player_parry_counter_outside_boss_attack_is_not_rewarded(self) -> None:
+        tracker = RewardTracker()
+        tracker.step(snapshot(timestamp=1.0, player_parry_events=0))
+        reward = tracker.step(snapshot(timestamp=1.1, player_parry_events=1))
+        self.assertEqual(reward.player_parries, 0)
+        self.assertEqual(reward.parry_reward, 0.0)
 
     def test_attack_without_active_phase_does_not_reward_dodge(self) -> None:
         tracker = RewardTracker()
-        tracker.step(snapshot("Slash Antic"))
-        reward = tracker.step(snapshot("Movement 1"))
+        tracker.step(snapshot("Slash Antic", timestamp=1.0))
+        tracker.step(snapshot("Movement 1", timestamp=1.1))
+        reward = tracker.step(snapshot("Movement 1", timestamp=1.4))
         self.assertEqual(reward.dodge, 0.0)
+
+    def test_nearby_attack_types_form_one_hurt_sensitive_combo(self) -> None:
+        tracker = RewardTracker()
+        tracker.step(snapshot("Slash Antic", health=10, timestamp=1.0))
+        tracker.step(snapshot("Slash 3", health=10, timestamp=1.1))
+        tracker.step(snapshot("Spin Antic", health=10, timestamp=1.2))
+        tracker.step(snapshot("Spin Attack", health=10, timestamp=1.3))
+        tracker.step(snapshot("Movement 1", health=9, timestamp=1.4))
+        reward = tracker.step(snapshot("Movement 1", health=9, timestamp=1.6))
+        self.assertEqual(reward.attack_finished, "slash+spin_attack")
+        self.assertEqual(reward.dodge, 0.0)
+        self.assertTrue(reward.attack_hurt_player)
+
+    def test_attack_after_combo_gap_starts_a_new_window(self) -> None:
+        tracker = RewardTracker()
+        tracker.step(snapshot("Slash Antic", timestamp=1.0))
+        tracker.step(snapshot("Slash 3", timestamp=1.1))
+        reward = tracker.step(snapshot("Spin Antic", timestamp=1.4))
+        self.assertEqual(reward.attack_finished, "slash")
+        self.assertEqual(reward.dodge, DODGE_REWARD)
 
     def test_damage_total_scales_reward_proportionally(self) -> None:
         tracker = RewardTracker()

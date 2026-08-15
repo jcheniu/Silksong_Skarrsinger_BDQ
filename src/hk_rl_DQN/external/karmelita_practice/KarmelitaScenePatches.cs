@@ -7,6 +7,13 @@ namespace KarmelitaPractice;
 [HarmonyPatch]
 internal static class KarmelitaScenePatches
 {
+    [HarmonyPostfix]
+    [HarmonyPatch(typeof(HeroController), nameof(HeroController.NailParry))]
+    private static void RecordPlayerNailParry(HeroController __instance)
+    {
+        KarmelitaPracticePlugin.Instance?.RecordPlayerParry(__instance);
+    }
+
     [HarmonyPrefix]
     [HarmonyPatch(typeof(CameraTarget), nameof(CameraTarget.Update))]
     private static bool FollowHeroAndKarmelita(CameraTarget __instance)

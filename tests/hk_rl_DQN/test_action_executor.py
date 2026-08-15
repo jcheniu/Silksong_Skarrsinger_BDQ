@@ -1,9 +1,10 @@
-from pathlib import Path
 import unittest
-from unittest.mock import call, patch
+from pathlib import Path
+from unittest.mock import patch
 
 from hk_rl_DQN.final_project import action_executor
 from hk_rl_DQN.final_project.action_executor import (
+    BRANCH_NAMES,
     BRANCH_SIZES,
     KeyboardActionExecutor,
     action_keys,
@@ -13,224 +14,165 @@ from hk_rl_DQN.final_project.action_executor import (
 )
 from hk_rl_DQN.final_project.action_recorder import ActionRecorder
 from hk_rl_DQN.real_state import decode_player_resources
-from hk_rl_DQN.tools.cold_start_action_test import KEYS as COLD_START_KEYS
+
+
+ALL_ACTIONS_AVAILABLE = tuple(
+    tuple(True for _ in range(size)) for size in BRANCH_SIZES
+)
 
 
 class ActionExecutorTests(unittest.TestCase):
-    def test_focus_waits_for_cold_started_game_window(self) -> None:
-        with (
-            patch.object(
-                action_executor,
-                "find_game_window",
-                side_effect=[RuntimeError("not ready"), 123],
-            ),
-            patch.object(action_executor.time, "sleep") as sleep,
-            patch.object(action_executor.ctypes, "windll") as windll,
-        ):
-            self.assertEqual(action_executor.focus_game_window(timeout_s=1.0), 123)
-        sleep.assert_called_once_with(0.25)
-        windll.user32.SetForegroundWindow.assert_called_once_with(123)
+    def test_standard_three_head_schema(self) -> None:
+        self.assertEqual(BRANCH_NAMES, ("jump_z", "movement", "combat"))
+        self.assertEqual(BRANCH_SIZES, (3, 7, 7))
 
-    def test_heal_key_is_not_supported(self) -> None:
-        self.assertNotIn("A", COLD_START_KEYS)
-
-    def test_dreamnail_is_disabled(self) -> None:
-        masks, reasons = branch_availability({})
-        self.assertEqual(masks[6], (True, False))
-        self.assertIn("dream_d disabled by policy", reasons)
-        self.assertNotIn("D", action_keys((0, 0, 0, 0, 0, 0, 1, 0)))
-
-    def test_combined_action_decodes_to_simultaneous_keys(self) -> None:
-        action = (2, 1, 0, 1, 0, 0, 0, 0)
-        self.assertEqual(action_keys(action), ("RightArrow", "Z", "X"))
-        self.assertEqual(decode_actions(action), ("right", "jump", "attack"))
-
-        mobility = (1, 3, 2, 2, 0, 0, 0, 0)
-        self.assertEqual(action_keys(mobility), ("LeftArrow", "Z", "C", "X"))
+    def test_heads_compose_in_one_control_frame(self) -> None:
+        action = (2, 5, 1)
+        self.assertEqual(action_keys(action), ("Z", "RightArrow", "C", "X"))
         self.assertEqual(
-            decode_actions(mobility),
-            ("left", "double_jump", "quick_run", "attack_charge"),
+            decode_actions(action),
+            ("jump_hold", "right", "dash", "attack"),
+        )
+        self.assertEqual(action_keys((0, 6, 1)), ("S", "X"))
+        self.assertEqual(
+            decode_actions((0, 6, 1)), ("harpoon_dash", "attack")
         )
 
-    def test_double_jump_retriggers_z_keydown(self) -> None:
-        path = Path("tests/.double_jump_retrigger.jsonl")
+    def test_movement_head_contains_direction_and_directed_dash(self) -> None:
+        self.assertEqual(action_keys((0, 1, 0)), ("LeftArrow",))
+        self.assertEqual(action_keys((0, 2, 0)), ("RightArrow",))
+        self.assertEqual(action_keys((0, 3, 0)), ("C",))
+        self.assertEqual(action_keys((0, 4, 0)), ("LeftArrow", "C"))
+        self.assertEqual(action_keys((0, 5, 0)), ("RightArrow", "C"))
+        self.assertEqual(action_keys((0, 6, 0)), ("S",))
+
+    def test_combat_head_is_mutually_exclusive(self) -> None:
+        expected = {
+            0: (),
+            1: ("X",),
+            2: ("X",),
+            3: ("LeftShift",),
+            4: ("V",),
+            5: ("UpArrow", "X"),
+            6: ("DownArrow", "X"),
+        }
+        for value, keys in expected.items():
+            self.assertEqual(action_keys((0, 0, value)), keys)
+
+    def test_directional_attacks_decode_and_start_as_x_attacks(self) -> None:
+        path = Path("tests/.directional_attacks.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path))
+        try:
+            up = executor.apply((0, 0, 5), branch_masks=ALL_ACTIONS_AVAILABLE)
+            down = executor.apply((0, 0, 6), branch_masks=ALL_ACTIONS_AVAILABLE)
+            self.assertEqual(decode_actions((0, 0, 5)), ("up_attack",))
+            self.assertEqual(decode_actions((0, 0, 6)), ("down_attack",))
+            self.assertIn("attack_x", up["started_branches"])
+            self.assertIn("attack_x", down["started_branches"])
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_generic_jump_press_retriggers_z(self) -> None:
+        path = Path("tests/.jump_retrigger.jsonl")
         executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
-        masks = tuple(tuple(True for _ in range(size)) for size in BRANCH_SIZES)
         executor.send_input = True
         try:
             with patch.object(action_executor, "_send_key") as send_key:
-                executor.apply((0, 1, 0, 0, 0, 0, 0, 0), branch_masks=masks)
-                send_key.reset_mock()
-                executor.apply((0, 3, 0, 0, 0, 0, 0, 0), branch_masks=masks)
-                self.assertIn(call("Z", True), send_key.call_args_list)
-                self.assertIn(call("Z", False), send_key.call_args_list)
+                executor.apply((1, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+                executor.apply((1, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            self.assertIn(("Z", True), [call.args for call in send_key.call_args_list])
+            self.assertGreaterEqual(
+                sum(call.args == ("Z", False) for call in send_key.call_args_list), 2
+            )
         finally:
             executor.send_input = False
             executor.close()
             path.unlink(missing_ok=True)
 
-    def test_short_jump_releases_on_next_tick(self) -> None:
-        path = Path("tests/.short_jump.jsonl")
-        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100, send_input=False)
-        masks = tuple(tuple(True for _ in range(size)) for size in BRANCH_SIZES)
+    def test_jump_hold_is_controlled_each_tick_without_phase_logic(self) -> None:
+        path = Path("tests/.generic_jump_hold.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
         try:
-            first = executor.apply((0, 1, 0, 0, 0, 0, 0, 0), branch_masks=masks)
-            second = executor.apply((0, 0, 0, 0, 0, 0, 0, 0), branch_masks=masks)
-            self.assertIn("jump", first["actions"])
-            self.assertEqual(second["actions"], ["wait"])
+            held = executor.apply((2, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            released = executor.apply((0, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            self.assertIn("Z", held["keys"])
+            self.assertNotIn("Z", released["keys"])
+            self.assertEqual(held["action_vector"], [2, 0, 0])
+            self.assertEqual(released["action_vector"], [0, 0, 0])
         finally:
+            executor.send_input = False
             executor.close()
             path.unlink(missing_ok=True)
 
-    def test_hold_jump_continues_after_intent_tick(self) -> None:
-        path = Path("tests/.hold_jump.jsonl")
-        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100, send_input=False)
-        masks = tuple(tuple(True for _ in range(size)) for size in BRANCH_SIZES)
+    def test_jump_hold_can_continue_beyond_known_game_effect_window(self) -> None:
+        path = Path("tests/.unbounded_jump_hold.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
         try:
             frames = [
-                executor.apply((0, 2, 0, 0, 0, 0, 0, 0), branch_masks=masks),
-                executor.apply((0, 0, 0, 0, 0, 0, 0, 0), branch_masks=masks),
-                executor.apply((0, 0, 0, 0, 0, 0, 0, 0), branch_masks=masks),
-                executor.apply((0, 0, 0, 0, 0, 0, 0, 0), branch_masks=masks),
-                executor.apply((0, 0, 0, 0, 0, 0, 0, 0), branch_masks=masks),
+                executor.apply((2, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+                for _ in range(12)
             ]
-            self.assertTrue(all("Z" in item["keys"] for item in frames[:4]))
-            self.assertTrue(all(item["action_vector"][1] == 2 for item in frames[:4]))
-            self.assertNotIn("Z", frames[4]["keys"])
-            self.assertEqual(frames[4]["action_vector"][1], 0)
+            self.assertTrue(all("Z" in item["keys"] for item in frames))
+            state = executor.control_state({})
+            self.assertEqual(state.jump_state, 1.0)
         finally:
+            executor.send_input = False
             executor.close()
             path.unlink(missing_ok=True)
 
-    def test_tap_attack_is_exposed_and_charge_requires_value_two(self) -> None:
-        path = Path("tests/.attack_fragments.jsonl")
-        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100, send_input=False)
-        masks = tuple(tuple(True for _ in range(size)) for size in BRANCH_SIZES)
-        try:
-            tap = executor.apply((0, 0, 0, 1, 0, 0, 0, 0), branch_masks=masks)
-            charge = executor.apply((0, 0, 0, 2, 0, 0, 0, 0), branch_masks=masks)
-            release = executor.apply((0, 0, 0, 0, 0, 0, 0, 0), branch_masks=masks)
-            self.assertEqual(tap["actions"], ["attack"])
-            self.assertEqual(tap["charge_elapsed_ms"], 0)
-            self.assertEqual(charge["actions"], ["attack_charge"])
-            self.assertEqual(charge["charge_elapsed_ms"], 100)
-            self.assertEqual(release["charge_elapsed_ms"], 0)
-        finally:
-            executor.close()
-            path.unlink(missing_ok=True)
+    def test_jump_branch_is_never_semantically_masked(self) -> None:
+        masks, reasons = branch_availability(
+            {
+                "player_grounded": False,
+                "player_control": {
+                    "jump_available": False,
+                    "double_jump_available": False,
+                    "dash_available": False,
+                    "attack_available": False,
+                },
+            }
+        )
+        self.assertEqual(masks[0], (True, True, True))
+        self.assertFalse(any("jump" in reason for reason in reasons))
 
-    def test_all_branches_remain_composable(self) -> None:
-        action = (2, 2, 2, 2, 1, 1, 0, 1)
+    def test_dash_values_share_one_movement_mask(self) -> None:
+        unavailable, _ = branch_availability(
+            {"player_control": {"dash_available": False}}
+        )
+        available, _ = branch_availability(
+            {"player_control": {"dash_available": True}}
+        )
         self.assertEqual(
-            action_keys(action),
-            ("RightArrow", "Z", "C", "X", "S", "LeftShift", "V"),
+            unavailable[1], (True, True, True, False, False, False, False)
+        )
+        self.assertEqual(
+            available[1], (True, True, True, True, True, True, False)
         )
 
-    def test_taunt_press_edge_is_recorded(self) -> None:
-        path = Path("tests/.taunt_press_edge.jsonl")
-        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
-        try:
-            first = executor.apply((0, 0, 0, 0, 0, 0, 0, 1))
-            held = executor.apply((0, 0, 0, 0, 0, 0, 0, 1))
-            self.assertIn("V", first["newly_pressed_keys"])
-            self.assertNotIn("V", held["newly_pressed_keys"])
-        finally:
-            executor.close()
-            path.unlink(missing_ok=True)
+    def test_charge_can_continue_but_harpoon_requires_current_availability(self) -> None:
+        snapshot = {
+            "player_control": {"dash_available": False, "attack_available": False},
+            "player_resources": {
+                "silk": 0,
+                "silk_max": 9,
+                "silk_parts": 0,
+                "skill_cost": 4,
+                "silk_abilities_disabled": False,
+                "skill_available": False,
+                "spell_available": False,
+            },
+        }
+        charge_masks, _ = branch_availability(snapshot, (0, 0, 2))
+        skill_masks, _ = branch_availability(snapshot, (0, 6, 0))
+        self.assertFalse(charge_masks[2][1])
+        self.assertFalse(charge_masks[2][5])
+        self.assertFalse(charge_masks[2][6])
+        self.assertTrue(charge_masks[2][2])
+        self.assertFalse(skill_masks[1][6])
 
-    def test_invalid_branch_is_rejected(self) -> None:
-        with self.assertRaises(ValueError):
-            validate_action((3,) + (0,) * (len(BRANCH_SIZES) - 1))
-
-    def test_dry_run_records_vector_without_sending_input(self) -> None:
-        path = Path("tests/.action_executor.jsonl")
-        recorder = ActionRecorder(path)
-        try:
-            executor = KeyboardActionExecutor(recorder, send_input=False)
-            item = executor.apply((1, 0, 1, 0, 0, 0, 0, 0))
-            executor.close()
-            self.assertEqual(item["actions"], ["left", "dash"])
-            self.assertEqual(item["action_vector"], [1, 0, 1, 0, 0, 0, 0, 0])
-        finally:
-            path.unlink(missing_ok=True)
-
-    def test_attack_branch_accumulates_charge_metadata(self) -> None:
-        path = Path("tests/.action_executor_charge.jsonl")
-        recorder = ActionRecorder(path)
-        try:
-            executor = KeyboardActionExecutor(recorder, tick_ms=100, send_input=False)
-            first = executor.apply((0, 0, 0, 2, 0, 0, 0, 0))
-            second = executor.apply((0, 0, 0, 2, 0, 0, 0, 0))
-            released = executor.apply((0, 0, 0, 0, 0, 0, 0, 0))
-            executor.close()
-            self.assertEqual(first["charge_elapsed_ms"], 100)
-            self.assertEqual(second["charge_elapsed_ms"], 200)
-            self.assertEqual(released["charge_elapsed_ms"], 0)
-        finally:
-            path.unlink(missing_ok=True)
-
-    def test_control_state_tracks_x_c_s_holds_and_interruption(self) -> None:
-        path = Path("tests/.action_executor_state.jsonl")
-        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100, send_input=False)
-        try:
-            executor.apply((0, 2, 1, 1, 1, 0, 0, 0))
-            state = executor.control_state(
-                {
-                    "player_grounded": True,
-                    "player_control": {
-                        "jump_available": True,
-                        "double_jump_available": False,
-                        "dash_available": True,
-                        "sprint_available": True,
-                        "attack_available": True,
-                    },
-                }
-            )
-            self.assertTrue(state.jump_held)
-            self.assertAlmostEqual(state.jump_hold_progress, 100 / 350)
-            self.assertTrue(state.jump_available)
-            self.assertFalse(state.double_jump_available)
-            self.assertTrue(state.attack_held)
-            self.assertTrue(state.dash_held)
-            self.assertTrue(state.skill_held)
-            self.assertAlmostEqual(state.attack_hold_progress, 100 / 1350)
-            self.assertAlmostEqual(state.dash_hold_progress, 100 / 300)
-            self.assertAlmostEqual(state.skill_hold_progress, 100 / 900)
-
-            executor.release_all()
-            interrupted = executor.control_state({})
-            self.assertFalse(interrupted.jump_held)
-            self.assertEqual(interrupted.jump_hold_progress, 0.0)
-            self.assertFalse(interrupted.attack_held)
-            self.assertEqual(interrupted.attack_hold_progress, 0.0)
-            self.assertEqual(interrupted.dash_hold_progress, 0.0)
-            self.assertEqual(interrupted.skill_hold_progress, 0.0)
-            self.assertTrue(interrupted.interrupted)
-        finally:
-            executor.close()
-            path.unlink(missing_ok=True)
-
-    def test_action_log_contains_masks_and_reasons(self) -> None:
-        path = Path("tests/.action_executor_masks.jsonl")
-        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
-        try:
-            masks, reasons = branch_availability({})
-            item = executor.apply(
-                (0, 0, 0, 0, 1, 1, 0, 0),
-                branch_masks=masks,
-                masked_reasons=reasons,
-                player_resources=decode_player_resources({}),
-            )
-            self.assertEqual(item["action_vector"], [0] * len(BRANCH_SIZES))
-            self.assertEqual(item["branch_masks"], [list(branch) for branch in masks])
-            self.assertEqual(item["masked_reasons"], list(reasons))
-            self.assertIn("player_resources", item)
-        finally:
-            executor.close()
-            path.unlink(missing_ok=True)
-
-    def test_explicit_availability_is_required(self) -> None:
-        masks, _ = branch_availability(
+    def test_quick_cast_mask_uses_resource_telemetry(self) -> None:
+        allowed, _ = branch_availability(
             {
                 "player_resources": {
                     "silk": 5,
@@ -238,155 +180,198 @@ class ActionExecutorTests(unittest.TestCase):
                     "silk_parts": 0,
                     "skill_cost": 4,
                     "silk_abilities_disabled": False,
-                    "skill_available": False,
-                    "spell_available": False,
-                }
-            }
-        )
-        self.assertFalse(masks[4][1])
-        self.assertFalse(masks[5][1])
-
-    def test_harpoon_does_not_require_silk(self) -> None:
-        masks, _ = branch_availability(
-            {
-                "player_resources": {
-                    "silk": 0,
-                    "silk_max": 9,
-                    "silk_parts": 0,
-                    "skill_cost": 4,
-                    "silk_abilities_disabled": False,
                     "skill_available": True,
-                    "spell_available": False,
+                    "spell_available": True,
                 }
             }
         )
-        self.assertTrue(masks[4][1])
-        self.assertFalse(masks[5][1])
+        blocked, _ = branch_availability({})
+        self.assertTrue(allowed[2][3])
+        self.assertFalse(blocked[2][3])
 
-    def test_quick_cast_requires_enough_silk(self) -> None:
-        snapshot = {
-            "player_resources": {
-                "silk": 3,
-                "silk_max": 9,
-                "silk_parts": 0,
-                "skill_cost": 4,
-                "silk_abilities_disabled": False,
-                "skill_available": True,
-                "spell_available": True,
-            }
-        }
-        masks, reasons = branch_availability(snapshot)
-        self.assertFalse(masks[5][1])
-        self.assertTrue(any("silk 3 < cost 4" in reason for reason in reasons))
-
-        snapshot["player_resources"]["silk"] = 4
-        masks, _ = branch_availability(snapshot)
-        self.assertTrue(masks[5][1])
-
-    def test_quick_cast_rejects_disabled_or_incomplete_resources(self) -> None:
-        disabled = {
-            "player_resources": {
-                "silk": 9,
-                "silk_max": 9,
-                "silk_parts": 0,
-                "skill_cost": 4,
-                "silk_abilities_disabled": True,
-                "skill_available": True,
-                "spell_available": True,
-            }
-        }
-        disabled_masks, _ = branch_availability(disabled)
-        incomplete_masks, _ = branch_availability(
-            {"player_resources": {"silk": 9, "skill_cost": 4}}
-        )
-        self.assertFalse(disabled_masks[5][1])
-        self.assertFalse(incomplete_masks[5][1])
-
-    def test_player_control_masks_core_actions(self) -> None:
-        masks, reasons = branch_availability(
-            {
-                "player_control": {
-                    "jump_available": False,
-                    "dash_available": False,
-                    "attack_available": False,
-                }
-            }
-        )
-        self.assertFalse(masks[1][1])
-        self.assertFalse(masks[2][1])
-        self.assertFalse(masks[3][1])
-        self.assertTrue(any("jump_available" in reason for reason in reasons))
-
-    def test_double_jump_and_sprint_have_separate_legality(self) -> None:
-        airborne_masks, _ = branch_availability(
-            {
-                "player_grounded": False,
-                "player_control": {
-                    "jump_available": False,
-                    "double_jump_available": True,
-                    "dash_available": False,
-                    "sprint_available": True,
-                    "attack_available": True,
-                },
-            }
-        )
-        self.assertEqual(airborne_masks[1], (True, False, False, True))
-        self.assertEqual(airborne_masks[2], (True, False, False))
-
-        grounded_masks, _ = branch_availability(
-            {
-                "player_grounded": True,
-                "player_control": {
-                    "jump_available": True,
-                    "double_jump_available": False,
-                    "dash_available": True,
-                    "sprint_available": True,
-                    "attack_available": True,
-                },
-            }
-        )
-        self.assertEqual(grounded_masks[1], (True, True, True, False))
-        self.assertEqual(grounded_masks[2], (True, True, True))
-
-        active_sprint_masks, _ = branch_availability(
-            {
-                "player_grounded": True,
-                "player_control": {
-                    "sprint_available": False,
-                    "sprinting": True,
-                },
-            }
-        )
-        self.assertTrue(active_sprint_masks[2][2])
-
-    def test_direction_and_run_have_minimum_hold(self) -> None:
-        path = Path("tests/.smooth_movement.jsonl")
-        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
-        masks = tuple(tuple(True for _ in range(size)) for size in BRANCH_SIZES)
+    def test_dash_and_shift_are_real_retriggerable_pulses(self) -> None:
+        path = Path("tests/.three_head_pulses.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        executor.send_input = True
         try:
-            first = executor.apply((2, 0, 2, 0, 0, 0, 0, 0), branch_masks=masks)
-            second = executor.apply((1, 0, 0, 0, 0, 0, 0, 0), branch_masks=masks)
-            third = executor.apply((1, 0, 0, 0, 0, 0, 0, 0), branch_masks=masks)
-            self.assertEqual(first["action_vector"][0:3], [2, 0, 2])
-            self.assertEqual(second["action_vector"][0:3], [2, 0, 2])
-            self.assertEqual(third["action_vector"][0:3], [2, 0, 2])
+            with patch.object(action_executor, "_send_key") as send_key:
+                executor.apply((0, 3, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+                executor.apply((0, 3, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+                executor.apply((0, 0, 3), branch_masks=ALL_ACTIONS_AVAILABLE)
+                executor.apply((0, 0, 3), branch_masks=ALL_ACTIONS_AVAILABLE)
+            self.assertGreaterEqual(
+                sum(call.args == ("C", False) for call in send_key.call_args_list), 2
+            )
+            self.assertGreaterEqual(
+                sum(call.args == ("LeftShift", False) for call in send_key.call_args_list), 2
+            )
+        finally:
+            executor.send_input = False
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_charge_credit_event_occurs_only_on_completed_release(self) -> None:
+        path = Path("tests/.three_head_charge.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
+        try:
+            held = [
+                executor.apply((0, 0, 2), branch_masks=ALL_ACTIONS_AVAILABLE)
+                for _ in range(14)
+            ]
+            released = executor.apply((0, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            self.assertFalse(any("attack_x" in x["started_branches"] for x in held))
+            self.assertTrue(held[-1]["charge_completed"])
+            self.assertIn("attack_x", released["started_branches"])
         finally:
             executor.close()
             path.unlink(missing_ok=True)
 
-    def test_illegal_action_is_neutralized_and_recorded(self) -> None:
-        path = Path("tests/.illegal_action.jsonl")
+    def test_harpoon_is_one_tick_pulse_followed_by_action_lock(self) -> None:
+        path = Path("tests/.three_head_skill.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
+        try:
+            launch = executor.apply((2, 6, 1), branch_masks=ALL_ACTIONS_AVAILABLE)
+            locked = [
+                executor.apply((2, 2, 1), branch_masks=ALL_ACTIONS_AVAILABLE)
+                for _ in range(8)
+            ]
+            self.assertEqual(launch["attempted_action_vector"], [2, 6, 1])
+            self.assertEqual(launch["action_vector"], [0, 6, 0])
+            self.assertEqual(launch["keys"], ["S"])
+            self.assertIn("skill_s", launch["started_branches"])
+            self.assertTrue(launch["adjusted_reasons"])
+            self.assertTrue(all(item["action_vector"] == [0, 0, 0] for item in locked))
+            self.assertTrue(all("S" not in item["keys"] for item in locked))
+            self.assertTrue(all(item["illegal_branches"] == [] for item in locked))
+            self.assertFalse(executor.harpoon_locked)
+            relaunched = executor.apply((0, 6, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            self.assertEqual(relaunched["action_vector"], [0, 6, 0])
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_harpoon_control_state_separates_active_and_recovery(self) -> None:
+        path = Path("tests/.three_head_harpoon_state.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
+        try:
+            executor.apply((0, 6, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            active = executor.control_state({})
+            self.assertEqual(active.harpoon_phase, 0.25)
+            executor.apply((0, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            executor.apply((0, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            recovery = executor.control_state({})
+            self.assertEqual(recovery.harpoon_phase, 0.25)
+            executor.apply((0, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            self.assertGreater(executor.control_state({}).harpoon_phase, 0.25)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_harpoon_key_is_released_on_the_next_tick(self) -> None:
+        path = Path("tests/.three_head_harpoon_pulse.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
+        executor.send_input = True
+        try:
+            with patch.object(action_executor, "_send_key") as send_key:
+                executor.apply((0, 6, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+                executor.apply((0, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            calls = [call.args for call in send_key.call_args_list]
+            self.assertIn(("S", False), calls)
+            self.assertIn(("S", True), calls)
+            self.assertLess(calls.index(("S", False)), calls.index(("S", True)))
+        finally:
+            executor.send_input = False
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_interruption_clears_harpoon_lock(self) -> None:
+        path = Path("tests/.three_head_harpoon_interrupt.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
+        try:
+            item = executor.apply(
+                (2, 6, 1),
+                interrupted=True,
+                branch_masks=ALL_ACTIONS_AVAILABLE,
+            )
+            self.assertEqual(item["action_vector"], [0, 0, 0])
+            self.assertNotIn("skill_s", item["started_branches"])
+            self.assertFalse(executor.harpoon_locked)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_harpoon_lock_masks_all_policy_branches(self) -> None:
+        masks, reasons = branch_availability({}, harpoon_locked=True)
+        self.assertEqual(
+            masks,
+            tuple(tuple(index == 0 for index in range(size)) for size in BRANCH_SIZES),
+        )
+        self.assertTrue(any("harpoon" in reason for reason in reasons))
+
+    def test_taunt_has_one_press_edge_while_held(self) -> None:
+        path = Path("tests/.three_head_taunt.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path))
+        try:
+            first = executor.apply((0, 0, 4), branch_masks=ALL_ACTIONS_AVAILABLE)
+            held = executor.apply((0, 0, 4), branch_masks=ALL_ACTIONS_AVAILABLE)
+            self.assertIn("taunt_v", first["started_branches"])
+            self.assertNotIn("taunt_v", held["started_branches"])
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_control_state_tracks_compact_executed_action(self) -> None:
+        path = Path("tests/.three_head_state.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
+        try:
+            executor.apply((2, 4, 2), branch_masks=ALL_ACTIONS_AVAILABLE)
+            state = executor.control_state(
+                {
+                    "player_control": {
+                        "jump_available": False,
+                        "double_jump_available": False,
+                        "dash_available": True,
+                        "attack_available": True,
+                    }
+                }
+            )
+            self.assertEqual(state.jump_state, 1.0)
+            self.assertEqual(state.movement_direction, -1.0)
+            self.assertEqual(state.movement_mode, 0.5)
+            self.assertAlmostEqual(state.combat_action, 2 / 6)
+            self.assertAlmostEqual(state.attack_charge_progress, 100 / 1350)
+            self.assertEqual(state.harpoon_phase, 0.0)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_illegal_combat_action_is_neutralized_and_recorded(self) -> None:
+        path = Path("tests/.three_head_illegal.jsonl")
         executor = KeyboardActionExecutor(ActionRecorder(path))
         try:
             masks, reasons = branch_availability({})
             item = executor.apply(
-                (0, 2, 0, 0, 0, 0, 0, 0),
+                (0, 0, 3),
                 branch_masks=masks,
                 masked_reasons=reasons,
+                player_resources=decode_player_resources({}),
             )
-            self.assertEqual(item["attempted_action_vector"][1], 2)
-            self.assertEqual(item["action_vector"][1], 0)
-            self.assertIn("jump_z", item["illegal_branches"])
+            self.assertEqual(item["action_vector"], [0, 0, 0])
+            self.assertEqual(item["illegal_branches"], ["combat"])
         finally:
             executor.close()
             path.unlink(missing_ok=True)
+
+    def test_validate_action_rejects_wrong_shape_and_values(self) -> None:
+        with self.assertRaises(ValueError):
+            validate_action((0, 0))
+        with self.assertRaises(ValueError):
+            validate_action((3, 0, 0))
+        with self.assertRaises(ValueError):
+            validate_action((0, 7, 0))
+        with self.assertRaises(ValueError):
+            validate_action((0, 0, 7))
+
+
+if __name__ == "__main__":
+    unittest.main()

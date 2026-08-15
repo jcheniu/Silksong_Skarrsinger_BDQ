@@ -9,16 +9,19 @@ from __future__ import annotations
 from dataclasses import dataclass
 import json
 from pathlib import Path
+import re
 from typing import Iterable, Iterator, Mapping, TextIO
 
 
 # These limits match the simulator's coordinate conventions. Real positions
 # are normalized and clipped so a transient scene-loading value cannot explode
 # the input range.
-ARENA_WIDTH = 300.0
-ARENA_HEIGHT = 300.0
-VELOCITY_X_SCALE = 12.0
-VELOCITY_Y_SCALE = 12.0
+ARENA_CENTER_X = 148.5
+ARENA_HALF_WIDTH = 18.0
+VERTICAL_POSITION_SCALE = 30.0
+RELATIVE_POSITION_SCALE = 30.0
+VELOCITY_X_SCALE = 8.0
+VELOCITY_Y_SCALE = 8.0
 GROUND_Y = 20.0
 
 ATTACK_TYPES = (
@@ -36,53 +39,113 @@ ATTACK_TYPES = (
 ATTACK_PHASES = ("idle", "anticipation", "active", "recovery")
 REACTIONS = ("normal", "hit", "blocked", "evaded", "stunned", "dead")
 PHASE_EVENTS = ("none", "roar", "phase_transition")
-KINEMATIC_STATE_DIMENSIONS = 9
+BOSS_CONTROL_STATES = (
+    "A Rethrow Antic",
+    "A Rethrow Antic 2",
+    "Air Rethrow",
+    "Air Throw",
+    "Air Throw Antic",
+    "Air Throw Slash",
+    "Air Throw Slash 2",
+    "Approach Block",
+    "Battle Roar",
+    "Battle Roar End",
+    "Battle Start",
+    "Block",
+    "Cyclone 1",
+    "Cyclone 2",
+    "Cyclone 3",
+    "Cyclone 4",
+    "Cyclone Antic",
+    "Cyclone Multihit",
+    "Cyclone Recoil",
+    "Dash",
+    "Entry Fall",
+    "Entry Land",
+    "Hornet Dead",
+    "Jump Antic",
+    "Jump Launch",
+    "Launch Antic",
+    "Launch In",
+    "Launch In Antic",
+    "Launch Spin",
+    "Launch Up",
+    "Long Approach",
+    "Long Evade",
+    "Movement 1",
+    "Movement 2",
+    "Movement 3",
+    "Movement 4",
+    "Movement 5",
+    "P2 Roar",
+    "P2 Roar Antic",
+    "Roar",
+    "Roar Antic",
+    "Slash 1",
+    "Slash 2",
+    "Slash 3",
+    "Slash 4",
+    "Slash 5",
+    "Slash 6",
+    "Slash 7",
+    "Slash 8",
+    "Slash 9",
+    "Slash Antic",
+    "Slash End",
+    "Spin Antic",
+    "Spin Attack",
+    "Spin Attack Land",
+    "Spin Multihit",
+    "Spin Recoil",
+    "Stun Air",
+    "Stun Recover",
+    "Stunned",
+    "Throw 1",
+    "Throw 2",
+    "Throw Antic",
+    "Throw Fall",
+    "Throw Land",
+)
+KINEMATIC_STATE_DIMENSIONS = 10
 RESOURCE_STATE_DIMENSIONS = 1
+BOSS_SEMANTIC_FEATURES = (
+    "behavior_progress",
+    "attack_category",
+    "aerial",
+    "displacement",
+    "vertical_intent",
+    "hit_pattern",
+    "boss_status",
+)
+BOSS_SEMANTIC_DIMENSIONS = len(BOSS_SEMANTIC_FEATURES)
 BASE_STATE_DIMENSIONS = (
     KINEMATIC_STATE_DIMENSIONS
     + RESOURCE_STATE_DIMENSIONS
-    + len(ATTACK_TYPES)
-    + len(ATTACK_PHASES)
-    + len(REACTIONS)
-    + len(PHASE_EVENTS)
+    + BOSS_SEMANTIC_DIMENSIONS
 )
-CONTROL_STATE_DIMENSIONS = 13
+CONTROL_STATE_DIMENSIONS = 6
 STATE_DIMENSIONS = BASE_STATE_DIMENSIONS + CONTROL_STATE_DIMENSIONS
 
 
 @dataclass(frozen=True)
 class KeyHoldState:
-    """Persistent key state required by the Branching-DQN protocol."""
+    """Compressed previous-action state required by the Branching-DQN protocol."""
 
-    jump_held: bool = False
-    jump_hold_progress: float = 0.0
-    jump_available: bool = False
-    double_jump_available: bool = False
-    attack_held: bool = False
-    attack_hold_progress: float = 0.0
-    dash_held: bool = False
-    dash_hold_progress: float = 0.0
-    skill_held: bool = False
-    skill_hold_progress: float = 0.0
-    interrupted: bool = False
-    skill_available: bool = False
-    spell_available: bool = False
+    jump_state: float = 0.0
+    movement_direction: float = 0.0
+    movement_mode: float = 0.0
+    combat_action: float = 0.0
+    attack_charge_progress: float = 0.0
+    harpoon_phase: float = 0.0
 
     def as_tuple(self) -> tuple[float, ...]:
         return (
-            float(self.jump_held),
-            _clip(self.jump_hold_progress, 0.0, 1.0),
-            float(self.jump_available),
-            float(self.double_jump_available),
-            float(self.attack_held),
-            _clip(self.attack_hold_progress, 0.0, 1.0),
-            float(self.dash_held),
-            _clip(self.dash_hold_progress, 0.0, 1.0),
-            float(self.skill_held),
-            _clip(self.skill_hold_progress, 0.0, 1.0),
-            float(self.interrupted),
-            float(self.skill_available),
-            float(self.spell_available),
+            _clip(self.jump_state, 0.0, 1.0),
+            _clip(self.movement_direction),
+            _clip(self.movement_mode, 0.0, 1.0),
+            _clip(self.combat_action, 0.0, 1.0),
+            _clip(self.attack_charge_progress, 0.0, 1.0),
+            _clip(self.harpoon_phase, 0.0, 1.0),
         )
 
 
@@ -181,8 +244,162 @@ def _one_hot(value: str, choices: tuple[str, ...]) -> tuple[float, ...]:
     return tuple(1.0 if value == choice else 0.0 for choice in choices)
 
 
+_SEQUENCE_LENGTHS = {
+    "slash": 9,
+    "movement": 5,
+    "cyclone": 4,
+    "throw": 2,
+    "air throw slash": 2,
+    "a rethrow antic": 2,
+}
+
+
+def _sequence_progress(state: str, phase: str) -> float:
+    """Encode a named FSM step as a normalized behavior timeline."""
+
+    lowered = state.lower()
+    if phase == "anticipation" or "antic" in lowered:
+        return 0.1
+    if phase == "recovery" or any(
+        token in lowered for token in ("end", "recover", "land", "recoil")
+    ):
+        return 1.0
+    match = re.search(r"\s(\d+)$", lowered)
+    if match is None:
+        active_behavior = any(
+            token in lowered
+            for token in (
+                "approach",
+                "movement",
+                "evade",
+                "dash",
+                "jump",
+                "launch",
+                "entry",
+                "fall",
+                "throw",
+                "slash",
+                "spin",
+                "cyclone",
+                "block",
+                "roar",
+                "stun",
+            )
+        )
+        return 0.5 if phase == "active" or active_behavior else 0.0
+    step = int(match.group(1))
+    length = next(
+        (value for prefix, value in _SEQUENCE_LENGTHS.items() if lowered.startswith(prefix)),
+        step,
+    )
+    if length <= 1:
+        return 0.5
+    return _clip(0.2 + 0.6 * (step - 1) / (length - 1), 0.2, 0.8)
+
+
+def _boss_semantics(
+    control_state: str,
+    attack_type: str,
+    attack_phase: str,
+    reaction: str,
+    phase_event: str,
+) -> tuple[float, ...]:
+    """Compress raw Boss FSM labels into continuous, interpretable features."""
+
+    lowered = control_state.lower()
+    if "air throw slash" in lowered:
+        attack_category = 6
+    else:
+        attack_category = {
+            "none": 0,
+            "slash": 1,
+            "cyclone": 2,
+            "spin_attack": 2,
+            "ground_throw": 3,
+            "air_throw": 3,
+            "rethrow": 4,
+            "dash_grind": 5,
+            "jump_attack": 5,
+            "spear_slam": 5,
+        }[attack_type]
+    aerial = any(
+        token in lowered
+        for token in ("air ", "jump", "launch", "fall", "spin attack")
+    )
+    displacement = any(
+        token in lowered
+        for token in (
+            "approach",
+            "movement",
+            "evade",
+            "dash",
+            "jump",
+            "launch",
+            "entry",
+            "fall",
+            "land",
+            "spin attack",
+        )
+    )
+    if any(token in lowered for token in ("fall", "land", "slam", "dive")):
+        vertical_intent = -1.0
+    elif any(token in lowered for token in ("jump", "launch", "up")):
+        vertical_intent = 1.0
+    else:
+        vertical_intent = 0.0
+    if attack_type in {"cyclone", "spin_attack"}:
+        hit_pattern = 1.0
+    elif "multihit" in lowered:
+        hit_pattern = 0.5
+    else:
+        hit_pattern = 0.0
+    unknown_state = bool(control_state) and control_state not in BOSS_CONTROL_STATES
+    if reaction == "dead":
+        boss_status = 1.0
+    elif phase_event == "phase_transition":
+        boss_status = 0.9
+    elif phase_event == "roar":
+        boss_status = 0.75
+    elif reaction == "stunned":
+        boss_status = 0.6
+    elif reaction == "hit":
+        boss_status = 0.45
+    elif reaction == "blocked":
+        boss_status = 0.3
+    elif reaction == "evaded":
+        boss_status = 0.15
+    elif unknown_state:
+        boss_status = -1.0
+    else:
+        boss_status = 0.0
+    return (
+        _sequence_progress(control_state, attack_phase),
+        attack_category / 6.0,
+        float(aerial),
+        float(displacement),
+        vertical_intent,
+        hit_pattern,
+        boss_status,
+    )
+
+
 def _position(entity: Mapping[str, object] | None, key: str) -> float:
     return _number(entity.get(key)) if entity is not None else 0.0
+
+
+def _signed_squash(value: float, scale: float) -> float:
+    """Preserve high-speed ordering without hard clipping transient motion."""
+
+    return value / (abs(value) + scale) if value else 0.0
+
+
+def _facing(entity: Mapping[str, object] | None) -> float:
+    value = _position(entity, "facing")
+    if value > 0:
+        return 1.0
+    if value < 0:
+        return -1.0
+    return 0.0
 
 
 def _optional_int(value: object) -> int | None:
@@ -246,17 +463,27 @@ def _classify_attack(state: str) -> tuple[str, str]:
     lowered = state.lower()
     if not state:
         return "none", "idle"
-    if "slash" in lowered and "spin" not in lowered:
-        attack = "slash"
-    elif "cyclone" in lowered:
+    if "cyclone" in lowered:
         attack = "cyclone"
     elif "rethrow" in lowered or "re-throw" in lowered:
         attack = "rethrow"
     elif "air throw" in lowered or "airthrow" in lowered or "air sickle" in lowered:
         attack = "air_throw"
+    elif "slash" in lowered and "spin" not in lowered:
+        attack = "slash"
     elif lowered.startswith("throw") or "throw " in lowered:
         attack = "ground_throw"
-    elif any(token in lowered for token in ("spin attack", "spin antic", "spin dash", "launch spin")):
+    elif any(
+        token in lowered
+        for token in (
+            "spin attack",
+            "spin antic",
+            "spin dash",
+            "spin multihit",
+            "spin recoil",
+            "launch spin",
+        )
+    ):
         attack = "spin_attack"
     elif "dash grind" in lowered or lowered == "dash":
         attack = "dash_grind"
@@ -280,6 +507,8 @@ def _classify_phase_event(state: str) -> str:
     lowered = state.lower()
     if "p2 roar" in lowered or "p3 roar" in lowered:
         return "phase_transition"
+    if lowered == "battle start":
+        return "phase_transition"
     if "roar" in lowered:
         return "roar"
     return "none"
@@ -295,7 +524,7 @@ def _classify_reaction(items: list[Mapping[str, object]], control_state: str) ->
     )
     if death_fsm_active or control_lower in {"death", "die", "dead"}:
         return "dead"
-    if any("stunned" in state or state in {"stun", "stun start", "stun damage"} for state in lowered):
+    if any("stunned" in state or state.startswith("stun") for state in lowered):
         return "stunned"
     if any("block" in state for state in lowered):
         return "blocked"
@@ -338,21 +567,31 @@ def encode_snapshot(
     phase_event = _classify_phase_event(control_state)
     resources = decode_player_resources(snapshot)
 
+    relative_x = boss_x - player_x
+    relative_y = boss_y - player_y
+    player_velocity_x = _position(player, "velocity_x")
+    player_velocity_y = _position(player, "velocity_y")
+    relative_velocity_x = _position(boss, "velocity_x") - player_velocity_x
+    relative_velocity_y = _position(boss, "velocity_y") - player_velocity_y
     values = (
-        _clip(player_x / ARENA_WIDTH),
-        _clip(player_y / ARENA_HEIGHT),
-        _clip(_position(player, "velocity_x") / VELOCITY_X_SCALE),
-        _clip(_position(player, "velocity_y") / VELOCITY_Y_SCALE),
-        _clip((boss_x - player_x) / ARENA_WIDTH),
-        _clip((boss_y - player_y) / ARENA_HEIGHT),
-        _clip(_position(boss, "velocity_x") / VELOCITY_X_SCALE),
-        _clip(_position(boss, "velocity_y") / VELOCITY_Y_SCALE),
+        _clip((player_x - ARENA_CENTER_X) / ARENA_HALF_WIDTH),
+        _clip((player_y - GROUND_Y) / VERTICAL_POSITION_SCALE),
+        _signed_squash(player_velocity_x, VELOCITY_X_SCALE),
+        _signed_squash(player_velocity_y, VELOCITY_Y_SCALE),
+        _clip(relative_x / RELATIVE_POSITION_SCALE),
+        _clip(relative_y / RELATIVE_POSITION_SCALE),
+        _signed_squash(relative_velocity_x, VELOCITY_X_SCALE),
+        _signed_squash(relative_velocity_y, VELOCITY_Y_SCALE),
         1.0 if _grounded(snapshot, player) else 0.0,
+        _facing(player),
         resources.silk_normalized,
-        *_one_hot(attack_type, ATTACK_TYPES),
-        *_one_hot(attack_phase, ATTACK_PHASES),
-        *_one_hot(reaction, REACTIONS),
-        *_one_hot(phase_event, PHASE_EVENTS),
+        *_boss_semantics(
+            control_state,
+            attack_type,
+            attack_phase,
+            reaction,
+            phase_event,
+        ),
         *(key_state or KeyHoldState()).as_tuple(),
     )
     if len(values) != STATE_DIMENSIONS:

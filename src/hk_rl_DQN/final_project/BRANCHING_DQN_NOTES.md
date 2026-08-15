@@ -16,26 +16,29 @@
 建议动作空间：
 
 ```python
-MultiDiscrete([3, 4, 3, 3, 2, 2, 2, 2])
+MultiDiscrete([3, 7, 7])
 ```
 
 分支顺序必须固定，并保存在检查点元数据中：
 
 ```text
-horizontal: [neutral, left, right]
-jump_z:     [released, short_jump, hold_jump, double_jump]
-dash_c:     [released, dash, sustained_run]
-attack_x:   [released, tap_attack, attack_charge]
-skill_s:    [released, held]
-spell_shift:[released, held]
-dream_d:    [released, disabled]
-taunt_v:    [released, held]
+jump_z:  [released, press_z, hold_z]
+movement:[neutral, hold_left, hold_right, dash, left_dash, right_dash, pulse_s]
+combat:  [neutral, tap_x, hold_x, press_shift, hold_v, up_x, down_x]
 ```
+
+Movement exploration uses weights `32/32/12/8/8/8` for left, right, dash,
+left-dash, right-dash, and S. Exploratory left/right selections persist for
+2-3 total ticks. S is a one-tick pulse followed by an approximately 900 ms
+active/recovery commitment: jump, movement, and combat are neutral during the
+lock. Replay stores this coordinated action, while JSONL also preserves the
+policy's attempted vector. S damage credits the movement head and an S miss has
+no offensive-miss penalty.
 
 例如：
 
 ```python
-tensor([2, 1, 0, 1, 0, 0, 0, 0])
+tensor([2, 5, 1])
 ```
 
 表示同一个控制周期内同时执行 `right + jump + X`。各分支默认互不干扰；
@@ -47,16 +50,17 @@ tensor([2, 1, 0, 1, 0, 0, 0, 0])
 
 - `X` 短按并释放是普通攻击。
 - 连续多个周期保持 `X=held` 会累计蓄力。
-- 蓄力达到 1350 ms（约 81 帧）才算完成。
+- 蓄力达到 1350 ms（约 14 个 100 ms 控制周期）才算完成。
 - `X=released`、受击或游戏 FSM 中断时重置蓄力。
 - `C` 短按是冲刺，持续按住是快跑。
-- `S` 对应 `KeySupDash`/harpoon dash；它不消耗灵丝，合法性读取
+- `S` 对应移动头中的 `KeySupDash`/harpoon dash；它不消耗灵丝，合法性读取
   `HeroController.CanHarpoonDash()`。回血键 `A` 不进入动作空间，也不允许执行器发送。
 - `LeftShift` 消耗灵丝，执行器结合当前灵丝、技能消耗、禁用状态以及
   游戏控制/冷却判定做合法性检查。
 
-状态观测必须加入 `Z/X/C/S` 当前是否按住、累计时间，以及中断/可用状态，
-否则策略无法判断长按进度。
+状态观测不再逐键展开。执行器把上一帧实际动作压缩为跳跃状态、移动方向、
+移动方式、战斗类别、X 蓄力进度和 S 主动/后摇阶段共 6 维；动作可用性继续由
+每个分支的 mask 负责。
 
 不设置 `wall_jump` 分支。墙跳由 Agent 组合 `jump_z + left/right` 自行学习。
 
@@ -67,14 +71,9 @@ tensor([2, 1, 0, 1, 0, 0, 0, 0])
 ```python
 features = shared_network(state)
 
-horizontal_q = horizontal_head(features)  # 3
-jump_q = jump_head(features)               # 4
-dash_q = dash_head(features)               # 3
-attack_q = attack_head(features)           # 3
-skill_q = skill_head(features)             # 2
-spell_q = spell_head(features)             # 2
-dream_q = dream_head(features)             # 2
-taunt_q = taunt_head(features)             # 2
+jump_q = jump_head(features)          # 3
+movement_q = movement_head(features)  # 7
+combat_q = combat_head(features)      # 7
 ```
 
 每个输出头分别执行 `argmax`，然后拼成 `[batch, branch_count]` 动作 Tensor。
@@ -91,7 +90,7 @@ advantage stream。共享环境奖励可以用于所有分支，但训练时应�
 3. `BossDodgeEnv.step(int)` 改为接收并验证 Multi-Discrete 向量。
 4. 环境在同一 tick 应用全部分支，而不是按动作名互斥处理。
 5. Double DQN 对每个分支分别选择下一动作，并从 target 网络 gather 对应值。
-6. epsilon-greedy 每个控制帧只判定一次；探索时整个动作向量从各分支当前合法值中采样。
+6. epsilon-greedy 每个控制帧只判定一次；探索时按分支激活率稀疏采样合法组合，避免所有二元技能以 50% 概率同时按下。
 7. 动作掩码改成每分支掩码，结合灵丝、生命值、FSM 和冷却状态。
 8. 检查点保存分支名称、每分支大小、控制周期和动作协议版本。
 9. 真实执行器读取动作 Tensor/list，并把所有 held 分支转换为同时按键。
