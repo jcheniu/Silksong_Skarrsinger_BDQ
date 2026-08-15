@@ -129,7 +129,7 @@ STATE_DIMENSIONS = BASE_STATE_DIMENSIONS + CONTROL_STATE_DIMENSIONS
 
 @dataclass(frozen=True)
 class KeyHoldState:
-    """Compressed previous-action state required by the Branching-DQN protocol."""
+    """Compressed previous-action state required by the joint-action protocol."""
 
     jump_state: float = 0.0
     movement_direction: float = 0.0

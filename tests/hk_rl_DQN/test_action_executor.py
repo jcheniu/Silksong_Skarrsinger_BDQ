@@ -250,6 +250,73 @@ class ActionExecutorTests(unittest.TestCase):
             executor.close()
             path.unlink(missing_ok=True)
 
+    def test_harpoon_cannot_interrupt_charge_or_its_release(self) -> None:
+        path = Path("tests/.three_head_charge_harpoon_guard.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
+        try:
+            started = executor.apply(
+                (0, 6, 2), branch_masks=ALL_ACTIONS_AVAILABLE
+            )
+            self.assertEqual(started["action_vector"], [0, 0, 2])
+            self.assertFalse(executor.harpoon_locked)
+            self.assertTrue(executor.charge_protected)
+            held = [
+                executor.apply((0, 6, 2), branch_masks=ALL_ACTIONS_AVAILABLE)
+                for _ in range(13)
+            ]
+            self.assertTrue(held[-1]["charge_completed"])
+            released = executor.apply(
+                (0, 6, 0), branch_masks=ALL_ACTIONS_AVAILABLE
+            )
+            self.assertEqual(released["action_vector"], [0, 0, 0])
+            self.assertIn("attack_x", released["started_branches"])
+            self.assertNotIn("skill_s", released["started_branches"])
+            self.assertTrue(executor.charge_protected)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_charge_can_release_between_1400_and_3000_ms(self) -> None:
+        path = Path("tests/.three_head_charge_window.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
+        try:
+            held = [
+                executor.apply((0, 0, 2), branch_masks=ALL_ACTIONS_AVAILABLE)
+                for _ in range(30)
+            ]
+            self.assertTrue(held[13]["charge_completed"])
+            self.assertFalse(held[13]["charge_at_max"])
+            self.assertEqual(held[-1]["charge_elapsed_ms"], 3000)
+            self.assertTrue(held[-1]["charge_at_max"])
+            forced_release = executor.apply(
+                (0, 0, 2), branch_masks=ALL_ACTIONS_AVAILABLE
+            )
+            self.assertEqual(forced_release["action_vector"], [0, 0, 0])
+            self.assertIn("attack_x", forced_release["started_branches"])
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_incomplete_charge_is_a_minimum_commitment(self) -> None:
+        path = Path("tests/.three_head_charge_commitment.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
+        try:
+            executor.apply((0, 0, 2), branch_masks=ALL_ACTIONS_AVAILABLE)
+            frames = [
+                executor.apply((0, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+                for _ in range(13)
+            ]
+            self.assertTrue(all(item["action_vector"][2] == 2 for item in frames))
+            self.assertTrue(frames[-1]["charge_completed"])
+            released = executor.apply(
+                (0, 0, 0), branch_masks=ALL_ACTIONS_AVAILABLE
+            )
+            self.assertEqual(released["action_vector"], [0, 0, 0])
+            self.assertIn("attack_x", released["started_branches"])
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
     def test_harpoon_control_state_separates_active_and_recovery(self) -> None:
         path = Path("tests/.three_head_harpoon_state.jsonl")
         executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
@@ -308,6 +375,21 @@ class ActionExecutorTests(unittest.TestCase):
         )
         self.assertTrue(any("harpoon" in reason for reason in reasons))
 
+    def test_charge_protection_masks_harpoon_only(self) -> None:
+        masks, reasons = branch_availability({}, charge_protected=True)
+        self.assertFalse(masks[1][6])
+        self.assertTrue(masks[1][1])
+        self.assertTrue(masks[2][0])
+        self.assertTrue(any("charge" in reason for reason in reasons))
+
+    def test_incomplete_charge_masks_combat_to_hold_x(self) -> None:
+        masks, reasons = branch_availability({}, charge_must_hold=True)
+        self.assertEqual(
+            masks[2],
+            tuple(index == 2 for index in range(BRANCH_SIZES[2])),
+        )
+        self.assertTrue(any("keep holding" in reason for reason in reasons))
+
     def test_taunt_has_one_press_edge_while_held(self) -> None:
         path = Path("tests/.three_head_taunt.jsonl")
         executor = KeyboardActionExecutor(ActionRecorder(path))
@@ -339,7 +421,7 @@ class ActionExecutorTests(unittest.TestCase):
             self.assertEqual(state.movement_direction, -1.0)
             self.assertEqual(state.movement_mode, 0.5)
             self.assertAlmostEqual(state.combat_action, 2 / 6)
-            self.assertAlmostEqual(state.attack_charge_progress, 100 / 1350)
+            self.assertAlmostEqual(state.attack_charge_progress, 100 / 3000)
             self.assertEqual(state.harpoon_phase, 0.0)
         finally:
             executor.close()

@@ -12,8 +12,8 @@ from pathlib import Path
 from ..final_project.action_executor import validate_action
 
 
-# Every non-neutral value in the three BDQ heads, plus one simultaneous
-# three-head smoke test. Ticks describe repeated policy selections, not new
+# Every non-neutral value in the three semantic fields, plus one simultaneous
+# joint-action smoke test. Ticks describe repeated policy selections, not new
 # semantic actions invented by the test tool.
 BDQ_ACTION_CASES: dict[str, tuple[tuple[int, int, int], int]] = {
     "jump_press": ((1, 0, 0), 1),

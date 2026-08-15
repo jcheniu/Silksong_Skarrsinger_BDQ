@@ -29,6 +29,7 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
     private const float ChallengeCompleteTimeoutSeconds = 12f;
     private const float PostChallengeCorrectionDelaySeconds = 0.2f;
     private const float PostCorrectionVerifySeconds = 2f;
+    private const float PostAttackHitAttributionSeconds = 0.25f;
 
     private bool isTransitioning;
     private bool encounterActive;
@@ -42,6 +43,7 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
     private bool telemetryEnabled;
     private TelemetryRecorder? telemetry;
     private HeroController? subscribedHero;
+    private PlayMakerFSM? bossControlFsm;
     private Harmony? harmony;
     private float arenaMinX = float.NegativeInfinity;
     private float arenaMaxX = float.PositiveInfinity;
@@ -49,6 +51,18 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
     private readonly Dictionary<string, string> bossFsmStates = new();
     private int observedHeroHealth = -1;
     private long playerParryEvents;
+    private long encounterId;
+    private long bossAttackId;
+    private long activeBossAttackId;
+    private long bossAttackStartedEvents;
+    private long bossAttackActiveEvents;
+    private long bossAttackFinishedEvents;
+    private long bossAttackPlayerHitEvents;
+    private long lastFinishedBossAttackId;
+    private long lastPlayerHitBossAttackId;
+    private float lastFinishedBossAttackTime = float.NegativeInfinity;
+    private string activeBossAttackType = "none";
+    private string activeBossAttackPhase = "idle";
     private Vector3 observedHeroPosition;
     private bool observedHeroPositionValid;
 
@@ -56,6 +70,16 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
     internal bool IsEncounterActive => encounterActive && !isTransitioning;
     internal Transform? ActiveBoss { get; private set; }
     internal long PlayerParryEvents => playerParryEvents;
+    internal long EncounterId => encounterId;
+    internal long ActiveBossAttackId => activeBossAttackId;
+    internal long BossAttackStartedEvents => bossAttackStartedEvents;
+    internal long BossAttackActiveEvents => bossAttackActiveEvents;
+    internal long BossAttackFinishedEvents => bossAttackFinishedEvents;
+    internal long BossAttackPlayerHitEvents => bossAttackPlayerHitEvents;
+    internal long LastFinishedBossAttackId => lastFinishedBossAttackId;
+    internal long LastPlayerHitBossAttackId => lastPlayerHitBossAttackId;
+    internal string ActiveBossAttackType => activeBossAttackType;
+    internal string ActiveBossAttackPhase => activeBossAttackPhase;
 
     internal void RecordPlayerParry(HeroController hero)
     {
@@ -110,14 +134,17 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
 
     private void Update()
     {
-        if (!pluginEnabled || isTransitioning)
+        if (!pluginEnabled)
         {
             return;
         }
 
-        if (encounterActive)
+        TrackBossAttackEvents();
+        telemetry?.Tick(this);
+
+        if (isTransitioning)
         {
-            telemetry?.Tick(this);
+            return;
         }
 
         if (Input.GetKeyDown(KeyCode.F8))
@@ -441,7 +468,10 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
         encounterActive = boss != null;
         if (encounterActive)
         {
+            encounterId++;
             ActiveBoss = boss!.transform;
+            bossControlFsm = FindBossControlFsm(ActiveBoss);
+            ResetActiveBossAttack();
             Logger.LogInfo($"Karmelita boss found: {boss!.name}");
             StartCoroutine(MonitorBossIntent());
             PlayMakerFSM? challengeFsm = FindChallengeFsm();
@@ -536,6 +566,129 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
             yield return new WaitForSecondsRealtime(0.1f);
         }
         bossFsmStates.Clear();
+    }
+
+    private PlayMakerFSM? FindBossControlFsm(Transform boss)
+    {
+        foreach (PlayMakerFSM fsm in boss.GetComponentsInChildren<PlayMakerFSM>(true))
+        {
+            if (fsm.FsmName == "Control")
+            {
+                return fsm;
+            }
+        }
+        return null;
+    }
+
+    private void TrackBossAttackEvents()
+    {
+        if (!IsEncounterActive || ActiveBoss == null)
+        {
+            if (activeBossAttackId != 0)
+            {
+                FinishActiveBossAttack();
+            }
+            return;
+        }
+        if (bossControlFsm == null)
+        {
+            bossControlFsm = FindBossControlFsm(ActiveBoss);
+        }
+        string state = bossControlFsm?.ActiveStateName ?? string.Empty;
+        (string attackType, string attackPhase) = ClassifyBossAttack(state);
+        if (attackType == "none")
+        {
+            if (activeBossAttackId != 0)
+            {
+                FinishActiveBossAttack();
+            }
+        }
+        else
+        {
+            if (activeBossAttackId == 0 || attackType != activeBossAttackType)
+            {
+                if (activeBossAttackId != 0)
+                {
+                    FinishActiveBossAttack();
+                }
+                bossAttackId++;
+                activeBossAttackId = bossAttackId;
+                activeBossAttackType = attackType;
+                activeBossAttackPhase = attackPhase;
+                bossAttackStartedEvents++;
+                if (attackPhase == "active")
+                {
+                    bossAttackActiveEvents++;
+                }
+            }
+            else if (attackPhase == "active" && activeBossAttackPhase != "active")
+            {
+                bossAttackActiveEvents++;
+            }
+            activeBossAttackPhase = attackPhase;
+        }
+
+        if (PlayerData.instance == null)
+        {
+            return;
+        }
+        int health = PlayerData.instance.GetInt("health");
+        if (observedHeroHealth >= 0 && health < observedHeroHealth)
+        {
+            bool recentFinish = Time.realtimeSinceStartup - lastFinishedBossAttackTime
+                <= PostAttackHitAttributionSeconds;
+            long attributedId = activeBossAttackId != 0
+                ? activeBossAttackId
+                : recentFinish ? lastFinishedBossAttackId : 0;
+            if (attributedId != 0)
+            {
+                bossAttackPlayerHitEvents++;
+                lastPlayerHitBossAttackId = attributedId;
+            }
+        }
+        observedHeroHealth = health;
+    }
+
+    private void FinishActiveBossAttack()
+    {
+        lastFinishedBossAttackId = activeBossAttackId;
+        lastFinishedBossAttackTime = Time.realtimeSinceStartup;
+        bossAttackFinishedEvents++;
+        ResetActiveBossAttack();
+    }
+
+    private void ResetActiveBossAttack()
+    {
+        activeBossAttackId = 0;
+        activeBossAttackType = "none";
+        activeBossAttackPhase = "idle";
+    }
+
+    private static (string, string) ClassifyBossAttack(string state)
+    {
+        string lowered = state.ToLowerInvariant();
+        string attackType;
+        if (lowered.Contains("cyclone")) attackType = "cyclone";
+        else if (lowered.Contains("rethrow") || lowered.Contains("re-throw")) attackType = "rethrow";
+        else if (lowered.Contains("air throw") || lowered.Contains("airthrow") || lowered.Contains("air sickle")) attackType = "air_throw";
+        else if (lowered.Contains("slash") && !lowered.Contains("spin")) attackType = "slash";
+        else if (lowered.StartsWith("throw") || lowered.Contains("throw ")) attackType = "ground_throw";
+        else if (
+            lowered.Contains("spin attack") || lowered.Contains("spin antic")
+            || lowered.Contains("spin dash") || lowered.Contains("spin multihit")
+            || lowered.Contains("spin recoil") || lowered.Contains("launch spin")
+        ) attackType = "spin_attack";
+        else if (lowered.Contains("dash grind") || lowered == "dash") attackType = "dash_grind";
+        else if (lowered.Contains("spear slam")) attackType = "spear_slam";
+        else if (lowered.Contains("jump") || lowered.Contains("wall dive") || lowered.Contains("air dive")) attackType = "jump_attack";
+        else return ("none", "idle");
+
+        string phase = lowered.Contains("antic") || lowered.Contains("choice") || lowered.Contains("set ")
+            ? "anticipation"
+            : lowered.Contains("end") || lowered.Contains("recover") || lowered.Contains("land") || lowered.Contains("recoil")
+                ? "recovery"
+                : "active";
+        return (attackType, phase);
     }
 
     private void PlaceHeroOnCombatSide(Vector3 bossPosition, bool logPosition)

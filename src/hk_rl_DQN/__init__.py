@@ -1,4 +1,4 @@
-"""Live Silksong state, reward, action, and Branching-DQN modules."""
+"""Live Silksong state, reward, action, and joint-action DQN modules."""
 
 from .real_reward import RewardFrame, RewardTracker
 from .real_state import (

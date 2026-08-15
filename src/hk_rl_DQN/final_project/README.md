@@ -5,24 +5,21 @@ agent. It does not replace the verified `boss_env.py` simulator.
 
 ## Combat Actions
 
-The policy output is a three-value MultiDiscrete tensor/list for each control
-tick. Standard BDQ uses independent `jump_z`, `movement`, and `combat` heads.
-One value is selected inside each head, and the three selected values are
-applied together, so `right + attack` and `left + jump` remain valid.
+The executor consumes a three-value `jump_z`, `movement`, and `combat` vector
+for each control tick. The DQN evaluates all 147 combinations jointly, then
+decodes the selected ID back to this vector. This preserves combinations such
+as `right + attack` and `left + jump` while learning their coordination value.
 The recorder is intentionally separate from that adapter and only persists
 decoded frames as JSONL.
 
-The implemented Multi-Discrete / Branching DQN architecture is recorded in
+The implemented Multi-Discrete executor and joint-action DQN are recorded in
 `BRANCHING_DQN_NOTES.md`. The live trainer is `../real_dqn.py`; the former
 single-action baseline is preserved under `history/simulator_dqn_v1`.
 
-Boss attacks less than 0.25 seconds apart are evaluated as one combo window.
-When the whole window ends without player damage, dodge credit is discounted
-back through its buffered transitions for the `jump_z` and `movement` heads.
-When player damage occurs anywhere in the window, failed-dodge credit instead
-applies `-0.5 * 0.9^distance` to those same two heads. The combat head does not
-receive this branch-specific backfill; the ordinary common player-damage
-penalty still trains all three heads.
+Boss attacks use plugin-emitted `attack_id` lifecycle events. Each completed
+active attack distributes one fixed `+0.8` success or `-1.0` failure budget
+across its pending joint actions. Replay insertion waits for delayed credit to
+finish, so a sampled transition is immutable and cannot be rewritten later.
 Successful player nail clashes are read from the telemetry
 `player_parry_events` counter, not from the Boss `blocked` FSM reaction. A
 clash inside the Boss attack window gives `+2.0` to the recent X attack action
@@ -37,9 +34,12 @@ The action catalog is in `action_catalog.py`. It uses the local bindings:
 - `LeftArrow` / `RightArrow` / `C` / `S`: one movement head with held
   direction, neutral/directed dash values, and harpoon dash
 - `X`: tap for normal attack, or keep the `attack_charge` intent present over
-  successive frames. The charge state accumulates toward 1.35 s (about 14
-  100-ms control ticks). Only the completed release creates attack credit;
-  omitting it, switching/releasing early, or a hit interrupts and resets it.
+  successive frames. Completion requires at least 1.35 s; with 100 ms control
+  ticks, the first practical release is at 1.4 s. It is forced to release at
+  3.0 s. S is blocked during the hold and for 500 ms after a
+  completed release. Only a release at or after 1.35 s creates attack credit;
+  the executor keeps X held until that minimum, while a hit interrupts and
+  resets it.
 - `UpArrow + X` / `DownArrow + X`: upward and downward attacks are separate
   combat-head values. They create the same X attack-start credit event as a
   normal attack.
@@ -75,9 +75,9 @@ It records silk consumption as metadata; the real adapter must still reject an
 action when telemetry reports insufficient silk.
 
 Every catalog action also has a same-named callable in `action_functions.py`.
-`tools/run_all_actions.py` uses the same three-head executor as live training.
+`tools/run_all_actions.py` uses the same semantic-vector executor as live training.
 It covers every non-neutral branch value, directed dashes, charge release, and
-one simultaneous three-head combination, then writes a `summary.json` plus one
+one simultaneous joint-action combination, then writes a `summary.json` plus one
 JSONL file per case.
 Use `--interval-s 1` (the default) to leave a one-second gap between repeated
 tests. With `--reuse-game`, the same game process is retained while the native

@@ -1,4 +1,4 @@
-"""Cold-start BDQ action test with live BepInEx log synchronization.
+"""Cold-start joint-action test with live BepInEx log synchronization.
 
 The tool accepts either a compatibility atomic action name or the exact
 [jump_z, movement, combat] vector used by live training.

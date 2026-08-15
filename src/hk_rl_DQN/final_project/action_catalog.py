@@ -39,7 +39,7 @@ ACTION_CATALOG: tuple[ActionSpec, ...] = (
         "X",
         1350,
         False,
-        "Hold X continuously for about 14 control ticks; interruption invalidates it",
+        "Hold X for at least 1.35 seconds; release by 3 seconds",
     ),
     ActionSpec("quick_cast", "LeftShift", 50, True, "Cast the equipped spell; consumes silk"),
     ActionSpec("harpoon_dash", "S", 50, False, "Harpoon dash / KeySupDash"),
@@ -49,7 +49,7 @@ ACTION_CATALOG: tuple[ActionSpec, ...] = (
 ACTION_NAMES = tuple(spec.name for spec in ACTION_CATALOG)
 
 # Compatibility mapping for single-action tools. Live training emits the full
-# three-head vector directly; these entries select one equivalent branch value.
+# semantic vector directly; these entries select one equivalent field value.
 ACTION_VECTORS: dict[str, tuple[int, int, int]] = {
     "left": (0, 1, 0),
     "right": (0, 2, 0),

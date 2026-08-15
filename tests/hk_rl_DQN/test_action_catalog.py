@@ -107,6 +107,11 @@ class FinalActionCatalogTests(unittest.TestCase):
         for _ in range(27):
             result = state.step(True, 50)
         self.assertTrue(result["charge_completed"])
+        self.assertFalse(result["charge_at_max"])
+        for _ in range(33):
+            result = state.step(True, 50)
+        self.assertEqual(result["charge_elapsed_ms"], 3000)
+        self.assertTrue(result["charge_at_max"])
         result = state.step(False, 50)
         self.assertEqual(result["charge_elapsed_ms"], 0)
         self.assertFalse(result["charge_completed"])

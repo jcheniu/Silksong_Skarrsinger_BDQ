@@ -1,4 +1,5 @@
 from pathlib import Path
+from dataclasses import FrozenInstanceError
 import random
 import unittest
 from unittest.mock import patch
@@ -12,12 +13,24 @@ from hk_rl_DQN.final_project.action_executor import (
 from hk_rl_DQN.final_project.action_recorder import ActionRecorder
 from hk_rl_DQN.real_dqn import (
     ActionExplorationState,
+    ArenaActionWatchdog,
     ArenaResetGate,
     BranchingDQN,
+    COMBAT_ACTION_HURT_PENALTY_PER_HP,
+    COMBAT_EXPLORATION_WEIGHTS,
+    CREDIT_FINALIZATION_STEPS,
+    EVADE_FAILURE_PENALTY,
+    EVADE_SUCCESS_REWARD,
+    JOINT_ACTION_COUNT,
     LiveTrainer,
+    PendingTransition,
+    PURE_EXPLORATION_STEPS,
     ReplayBuffer,
     Transition,
     checkpoint_metadata,
+    decode_joint_action,
+    joint_action_id,
+    joint_action_mask,
     load_checkpoint,
     optimize_model,
     save_checkpoint,
@@ -32,6 +45,21 @@ ALL_ACTIONS_AVAILABLE = tuple(tuple(True for _ in range(size)) for size in BRANC
 ONLY_NEUTRAL_AVAILABLE = tuple(
     tuple(index == 0 for index in range(size)) for size in BRANCH_SIZES
 )
+
+
+def transition(
+    action: tuple[int, ...] = (0, 0, 0),
+    reward: float = 0.0,
+    done: bool = False,
+) -> Transition:
+    return Transition(
+        state=(0.0,) * STATE_DIMENSIONS,
+        action=joint_action_id(action),
+        reward=reward,
+        next_state=(0.5,) * STATE_DIMENSIONS,
+        done=done,
+        next_action_mask=joint_action_mask(ALL_ACTIONS_AVAILABLE),
+    )
 
 
 def snapshot(state: str, frame: int, health: int = 10) -> dict[str, object]:
@@ -52,6 +80,32 @@ def snapshot(state: str, frame: int, health: int = 10) -> dict[str, object]:
     }
 
 
+def with_attack_event(
+    item: dict[str, object],
+    *,
+    attack_id: int,
+    phase: str,
+    started: int = 1,
+    active: int = 1,
+    finished: int = 0,
+    hits: int = 0,
+    last_finished_id: int = 0,
+    last_hit_id: int = 0,
+) -> dict[str, object]:
+    item["boss_attack"] = {
+        "id": attack_id,
+        "type": "slash",
+        "phase": phase,
+        "started_events": started,
+        "active_events": active,
+        "finished_events": finished,
+        "player_hit_events": hits,
+        "last_finished_id": last_finished_id,
+        "last_player_hit_id": last_hit_id,
+    }
+    return item
+
+
 class BranchingDQNTests(unittest.TestCase):
     def test_terminal_snapshots_are_ignored_until_arena_exit(self) -> None:
         gate = ArenaResetGate()
@@ -62,11 +116,26 @@ class BranchingDQNTests(unittest.TestCase):
         self.assertFalse(gate.allow_snapshot(False))
         self.assertTrue(gate.allow_snapshot(True))
 
-    def test_network_has_one_head_per_branch(self) -> None:
+    def test_new_encounter_id_unlocks_without_inactive_snapshot(self) -> None:
+        gate = ArenaResetGate()
+        self.assertTrue(gate.allow_snapshot(True, 10))
+        gate.mark_episode_finished()
+        self.assertFalse(gate.allow_snapshot(True, 10))
+        self.assertTrue(gate.allow_snapshot(True, 11))
+
+    def test_action_watchdog_only_recovers_after_timeout(self) -> None:
+        watchdog = ArenaActionWatchdog(timeout_seconds=1.0)
+        self.assertFalse(watchdog.stalled(5.0))
+        watchdog.record(5.0)
+        self.assertFalse(watchdog.stalled(5.9))
+        self.assertTrue(watchdog.stalled(6.0))
+        watchdog.reset()
+        self.assertFalse(watchdog.stalled(10.0))
+
+    def test_network_scores_every_joint_action(self) -> None:
         network = BranchingDQN()
         values = network(torch.zeros(4, STATE_DIMENSIONS))
-        self.assertEqual(len(values), len(BRANCH_SIZES))
-        self.assertEqual([tuple(value.shape) for value in values], [(4, size) for size in BRANCH_SIZES])
+        self.assertEqual(tuple(values.shape), (4, JOINT_ACTION_COUNT))
 
     def test_random_action_is_valid(self) -> None:
         action = select_action(
@@ -83,8 +152,7 @@ class BranchingDQNTests(unittest.TestCase):
         with torch.no_grad():
             for parameter in network.parameters():
                 parameter.zero_()
-            for head in network.advantages:
-                head.bias[-1] = 100.0
+            network.advantage.bias[-1] = 100.0
         action = select_action(
             network,
             (0.0,) * STATE_DIMENSIONS,
@@ -145,7 +213,62 @@ class BranchingDQNTests(unittest.TestCase):
             device=torch.device("cpu"),
             branch_masks=ALL_ACTIONS_AVAILABLE,
         )
-        self.assertEqual(rng.random_calls, 2 + len(BRANCH_SIZES))
+        self.assertEqual(rng.random_calls, 3 + len(BRANCH_SIZES))
+
+    def test_combat_exploration_prefers_attacks_but_keeps_taunt_nonzero(self) -> None:
+        network = BranchingDQN()
+        rng = random.Random(119)
+        combats = [
+            select_action(
+                network,
+                (0.0,) * STATE_DIMENSIONS,
+                epsilon=1.0,
+                rng=rng,
+                device=torch.device("cpu"),
+                branch_masks=ALL_ACTIONS_AVAILABLE,
+            )[2]
+            for _ in range(3000)
+        ]
+        attack_count = sum(combats.count(value) for value in (1, 2, 5, 6))
+        self.assertGreater(attack_count, combats.count(4) * 20)
+        self.assertGreater(combats.count(4), 0)
+        self.assertEqual(len(COMBAT_EXPLORATION_WEIGHTS), BRANCH_SIZES[2])
+
+    def test_cold_start_uses_pure_exploration_before_normal_decay(self) -> None:
+        path = Path("tests/.real_dqn_epsilon.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            self.assertEqual(trainer.current_epsilon(), 1.0)
+            trainer.global_step = PURE_EXPLORATION_STEPS - 1
+            self.assertEqual(trainer.current_epsilon(), 1.0)
+            trainer.global_step = PURE_EXPLORATION_STEPS
+            self.assertEqual(trainer.current_epsilon(), 0.60)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_selected_q_values_reuse_action_forward_pass(self) -> None:
+        selected_q_values: list[float] = []
+        action = select_action(
+            BranchingDQN(),
+            (0.0,) * STATE_DIMENSIONS,
+            epsilon=0.0,
+            rng=random.Random(2),
+            device=torch.device("cpu"),
+            selected_q_values=selected_q_values,
+        )
+        self.assertEqual(len(action), len(BRANCH_SIZES))
+        self.assertEqual(len(selected_q_values), 1)
+        self.assertTrue(all(torch.isfinite(torch.tensor(selected_q_values))))
 
     def test_movement_exploration_prefers_direction_but_keeps_harpoon_nonzero(self) -> None:
         network = BranchingDQN()
@@ -207,52 +330,41 @@ class BranchingDQNTests(unittest.TestCase):
         target.load_state_dict(online.state_dict())
         optimizer = torch.optim.AdamW(online.parameters(), lr=1e-4)
         transitions = [
-            Transition(
-                state=(float(index % 2),) * STATE_DIMENSIONS,
-                action=tuple(index % size for size in BRANCH_SIZES),
-                reward=float(index),
-                next_state=(0.5,) * STATE_DIMENSIONS,
-                done=index == 3,
-                next_action_masks=ALL_ACTIONS_AVAILABLE,
+            transition(
+                tuple(index % size for size in BRANCH_SIZES),
+                float(index),
+                index == 3,
             )
             for index in range(4)
         ]
         loss = optimize_model(online, target, optimizer, transitions, torch.device("cpu"))
         self.assertGreaterEqual(loss, 0.0)
 
-    def test_double_dqn_target_uses_next_branch_masks(self) -> None:
+    def test_double_dqn_target_uses_joint_action_mask(self) -> None:
         online = BranchingDQN()
         target = BranchingDQN()
         with torch.no_grad():
             for network in (online, target):
                 for parameter in network.parameters():
                     parameter.zero_()
-            for head in online.advantages:
-                head.bias[1] = 10.0
-            for head in target.advantages:
-                head.bias[1] = 20.0
+            online.advantage.bias[1] = 10.0
+            target.advantage.bias[1] = 20.0
         transition = Transition(
             state=(0.0,) * STATE_DIMENSIONS,
-            action=(0,) * len(BRANCH_SIZES),
+            action=joint_action_id((0, 0, 0)),
             reward=0.0,
             next_state=(0.0,) * STATE_DIMENSIONS,
             done=False,
-            next_action_masks=ONLY_NEUTRAL_AVAILABLE,
+            next_action_mask=joint_action_mask(ONLY_NEUTRAL_AVAILABLE),
         )
         with torch.no_grad():
             online_values = online(torch.zeros(1, STATE_DIMENSIONS))
             target_values = target(torch.zeros(1, STATE_DIMENSIONS))
-            current = torch.stack(
-                [branch[:, 0] for branch in online_values],
-                dim=1,
-            )
-            masked_next = torch.stack(
-                [branch[:, 0] for branch in target_values],
-                dim=1,
-            ).mean(dim=1, keepdim=True)
+            current = online_values[:, joint_action_id((0, 0, 0))]
+            masked_next = target_values[:, joint_action_id((0, 0, 0))]
             expected_loss = torch.nn.functional.smooth_l1_loss(
                 current,
-                (0.99 * masked_next).expand_as(current),
+                0.99 * masked_next,
             ).item()
         optimizer = torch.optim.AdamW(online.parameters(), lr=0.0)
         loss = optimize_model(online, target, optimizer, [transition], torch.device("cpu"))
@@ -337,23 +449,21 @@ class BranchingDQNTests(unittest.TestCase):
         replay.append(
             Transition(
                 state=(0.25,) * STATE_DIMENSIONS,
-                action=(2, 5, 6),
+                action=joint_action_id((2, 5, 6)),
                 reward=1.5,
                 next_state=(-0.25,) * STATE_DIMENSIONS,
                 done=True,
-                next_action_masks=ALL_ACTIONS_AVAILABLE,
-                branch_rewards=[1.0, 1.5, 2.0],
+                next_action_mask=joint_action_mask(ALL_ACTIONS_AVAILABLE),
             )
         )
         restored = ReplayBuffer()
         restored.load_state_dict(replay.state_dict())
         self.assertEqual(len(restored), 1)
         item = restored._items[0]
-        self.assertEqual(item.action, (2, 5, 6))
+        self.assertEqual(item.action_vector, (2, 5, 6))
         self.assertEqual(item.done, True)
         self.assertAlmostEqual(item.reward, 1.5)
-        self.assertEqual(item.branch_rewards, [1.0, 1.5, 2.0])
-        self.assertEqual(item.next_action_masks, ALL_ACTIONS_AVAILABLE)
+        self.assertEqual(item.next_action_mask, joint_action_mask(ALL_ACTIONS_AVAILABLE))
 
     def test_checkpoint_restores_replay_without_new_warmup(self) -> None:
         path = Path("tests/.replay_checkpoint.pt")
@@ -363,13 +473,9 @@ class BranchingDQNTests(unittest.TestCase):
         replay = ReplayBuffer()
         for index in range(1000):
             replay.append(
-                Transition(
-                    state=(float(index % 2),) * STATE_DIMENSIONS,
-                    action=tuple(index % size for size in BRANCH_SIZES),
-                    reward=float(index) / 1000,
-                    next_state=(0.5,) * STATE_DIMENSIONS,
-                    done=False,
-                    next_action_masks=ALL_ACTIONS_AVAILABLE,
+                transition(
+                    tuple(index % size for size in BRANCH_SIZES),
+                    float(index) / 1000,
                 )
             )
         try:
@@ -399,16 +505,7 @@ class BranchingDQNTests(unittest.TestCase):
 
     def test_explicit_reset_clears_restored_replay_target(self) -> None:
         replay = ReplayBuffer()
-        replay.append(
-            Transition(
-                state=(0.0,) * STATE_DIMENSIONS,
-                action=(0, 0, 0),
-                reward=0.0,
-                next_state=(0.0,) * STATE_DIMENSIONS,
-                done=False,
-                next_action_masks=ALL_ACTIONS_AVAILABLE,
-            )
-        )
+        replay.append(transition())
         online = BranchingDQN()
         result = load_checkpoint(
             Path("tests/.unused_reset_checkpoint.pt"),
@@ -441,13 +538,66 @@ class BranchingDQNTests(unittest.TestCase):
             trainer.observe(snapshot("Slash Antic", 1))
             trainer.observe(snapshot("Slash 1", 2))
             self.assertEqual(len(trainer.replay), 0)
-            self.assertEqual(len(trainer.pending_attack_transitions), 1)
-            trainer.observe(snapshot("Movement 1", 3))
-            trainer.observe(snapshot("Movement 1", 4))
-            trainer.observe(snapshot("Movement 1", 5))
-            self.assertGreaterEqual(len(trainer.replay), 4)
-            self.assertEqual(trainer.global_step, 4)
+            self.assertEqual(len(trainer.pending_credit_transitions), 1)
+            for frame in range(3, CREDIT_FINALIZATION_STEPS + 3):
+                trainer.observe(snapshot("Movement 1", frame))
+            self.assertGreaterEqual(len(trainer.replay), 1)
+            self.assertEqual(trainer.global_step, CREDIT_FINALIZATION_STEPS + 1)
             self.assertIsNotNone(trainer.previous_action)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_inactive_lifecycle_snapshot_writes_terminal_transition(self) -> None:
+        path = Path("tests/.real_dqn_lifecycle_terminal.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 1, 0)):
+                trainer.observe(snapshot("Movement 1", 1))
+            inactive = snapshot("", 2)
+            inactive["encounter_active"] = False
+            inactive["boss"] = None
+            trainer.observe(inactive, force_terminal=True)
+            metric = trainer.finish_episode()
+            self.assertEqual(len(trainer.replay), 1)
+            self.assertTrue(trainer.replay._items[0].done)
+            self.assertEqual(metric["replay_size"], 1)
+            self.assertEqual(metric["global_step"], 1)
+            self.assertEqual(metric["gradient_updates"], 0)
+            self.assertEqual(metric["actual_action_counts"]["movement"]["hold_left"], 1)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_interrupted_episode_reset_breaks_cross_process_transition(self) -> None:
+        path = Path("tests/.real_dqn_interrupted_episode.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 1, 0)):
+                trainer.observe(snapshot("Movement 1", 1))
+            trainer.reset_interrupted_episode()
+            self.assertIsNone(trainer.previous_state)
+            self.assertIsNone(trainer.previous_action)
+            self.assertEqual(trainer.completed_episodes, 0)
+            self.assertEqual(trainer.metrics.episode, 1)
         finally:
             executor.close()
             path.unlink(missing_ok=True)
@@ -471,8 +621,9 @@ class BranchingDQNTests(unittest.TestCase):
                     trainer.observe(snapshot("Movement 1", 1))
                 with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0,) * len(BRANCH_SIZES)):
                     trainer.observe(snapshot("Movement 1", 2))
+            trainer._finalize_pending(force=True)
             transition = trainer.replay.sample(1, random.Random(0))[0]
-            self.assertEqual(transition.action, (0, 6, 0))
+            self.assertEqual(transition.action_vector, (0, 6, 0))
             self.assertEqual(trainer.previous_action, (0, 0, 0))
         finally:
             executor.close()
@@ -499,17 +650,16 @@ class BranchingDQNTests(unittest.TestCase):
                 trainer.observe(snapshot("Movement 1", 4))
                 trainer.observe(snapshot("Movement 1", 5))
                 trainer.observe(snapshot("Movement 1", 6))
+            trainer._finalize_pending(force=True)
             rewards = [item.reward for item in trainer.replay._items]
             self.assertGreater(trainer.metrics.dodge_backfill_reward, 0.0)
             self.assertGreater(sum(rewards), len(rewards) * STEP_PENALTY)
-            credited = next(
-                item
-                for item in trainer.replay._items
-                if item.branch_rewards[0] > item.branch_rewards[2]
-            )
+            self.assertAlmostEqual(trainer.metrics.dodge_backfill_reward, EVADE_SUCCESS_REWARD)
             self.assertAlmostEqual(
-                credited.branch_rewards[0], credited.branch_rewards[1]
+                sum(item.reward - STEP_PENALTY for item in trainer.replay._items),
+                EVADE_SUCCESS_REWARD,
             )
+            self.assertGreater(trainer.metrics.movement_dodge_reward, 0.0)
         finally:
             executor.close()
             path.unlink(missing_ok=True)
@@ -540,18 +690,15 @@ class BranchingDQNTests(unittest.TestCase):
                 trainer.observe(snapshot("Movement 1", 3, health=9))
                 trainer.observe(snapshot("Movement 1", 4, health=9))
                 trainer.observe(snapshot("Movement 1", 5, health=9))
+            trainer._finalize_pending(force=True)
             self.assertEqual(trainer.metrics.failed_dodges, 1)
             self.assertLess(trainer.metrics.evade_failure_backfill_penalty, 0.0)
             self.assertEqual(trainer.metrics.failed_dodges_by_attack, {"slash": 1})
-            penalized = [
-                item
+            shaped_total = sum(
+                item.reward - STEP_PENALTY
                 for item in trainer.replay._items
-                if item.branch_rewards[0] < item.branch_rewards[2]
-            ]
-            self.assertTrue(penalized)
-            self.assertTrue(
-                all(item.branch_rewards[0] == item.branch_rewards[1] for item in penalized)
             )
+            self.assertLessEqual(shaped_total, EVADE_FAILURE_PENALTY)
         finally:
             executor.close()
             path.unlink(missing_ok=True)
@@ -599,13 +746,23 @@ class BranchingDQNTests(unittest.TestCase):
                             second["boss_damage_total"] = outcome["boss_damage_total"]
                         trainer.observe(second)
                 self.assertEqual(trainer.metrics.taunt_penalty, expected)
+                trainer._finalize_pending(force=True)
                 affected = next(
-                    item for item in trainer.replay._items if item.action[2] == 4
+                    item for item in trainer.replay._items if item.action_vector[2] == 4
                 )
+                expected_reward = STEP_PENALTY + expected
+                if "health" in outcome:
+                    expected_reward += COMBAT_ACTION_HURT_PENALTY_PER_HP - 3.0
                 self.assertAlmostEqual(
-                    affected.branch_rewards[2] - affected.branch_rewards[0],
-                    expected,
+                    affected.reward,
+                    expected_reward,
                 )
+                self.assertEqual(trainer.metrics.unattributed_damage_reward, 0.5 if "boss_damage_total" in outcome else 0.0)
+                if "health" in outcome:
+                    self.assertEqual(
+                        trainer.metrics.combat_hurt_penalty,
+                        COMBAT_ACTION_HURT_PENALTY_PER_HP,
+                    )
             finally:
                 executor.close()
                 path.unlink(missing_ok=True)
@@ -647,9 +804,7 @@ class BranchingDQNTests(unittest.TestCase):
                 for frame in range(4, 23):
                     trainer.observe(snapshot("Movement 1", frame))
             credited = trainer.replay._items[0]
-            self.assertAlmostEqual(
-                credited.branch_rewards[2] - credited.branch_rewards[0], 0.5
-            )
+            self.assertAlmostEqual(credited.reward, STEP_PENALTY + 0.5)
             self.assertAlmostEqual(trainer.metrics.damage_credit_reward, 0.5)
             self.assertEqual(trainer.metrics.offensive_misses, 0)
         finally:
@@ -693,11 +848,9 @@ class BranchingDQNTests(unittest.TestCase):
                 for frame in range(4, 23):
                     trainer.observe(snapshot("Movement 1", frame))
             credited = next(
-                item for item in trainer.replay._items if item.action[1] == 6
+                item for item in trainer.replay._items if item.action_vector[1] == 6
             )
-            self.assertAlmostEqual(
-                credited.branch_rewards[1] - credited.branch_rewards[0], 0.5
-            )
+            self.assertAlmostEqual(credited.reward, STEP_PENALTY + 0.5)
             self.assertEqual(trainer.metrics.offensive_misses, 0)
             self.assertAlmostEqual(trainer.metrics.harpoon_damage_reward, 0.5)
         finally:
@@ -731,12 +884,9 @@ class BranchingDQNTests(unittest.TestCase):
                 for frame in range(1, 23):
                     trainer.observe(snapshot("Movement 1", frame))
             harpoon_transition = next(
-                item for item in trainer.replay._items if item.action[1] == 6
+                item for item in trainer.replay._items if item.action_vector[1] == 6
             )
-            self.assertEqual(
-                harpoon_transition.branch_rewards[1],
-                harpoon_transition.branch_rewards[0],
-            )
+            self.assertEqual(harpoon_transition.reward, STEP_PENALTY)
             self.assertEqual(trainer.metrics.offensive_misses, 0)
         finally:
             executor.close()
@@ -778,11 +928,9 @@ class BranchingDQNTests(unittest.TestCase):
                     later["player_parry_events"] = 1
                     trainer.observe(later)
             credited = next(
-                item for item in trainer.replay._items if item.action[2] == 5
+                item for item in trainer.replay._items if item.action_vector[2] == 5
             )
-            self.assertAlmostEqual(
-                credited.branch_rewards[2], STEP_PENALTY + 2.0
-            )
+            self.assertGreaterEqual(credited.reward, STEP_PENALTY + 2.0)
             self.assertEqual(trainer.metrics.player_parries, 1)
             self.assertEqual(trainer.metrics.parry_credit_reward, 2.0)
             self.assertEqual(trainer.metrics.offensive_misses, 0)
@@ -827,18 +975,140 @@ class BranchingDQNTests(unittest.TestCase):
                 missed = next(
                     item
                     for item in trainer.replay._items
-                    if item.action[2] == combat_value
+                    if item.action_vector[2] == combat_value
                 )
                 self.assertEqual(trainer.metrics.offensive_misses, 1)
-                self.assertAlmostEqual(
-                    missed.branch_rewards[2] - missed.branch_rewards[0], -0.5
-                )
+                self.assertAlmostEqual(missed.reward, STEP_PENALTY - 0.5)
                 self.assertEqual(
                     getattr(trainer.metrics, f"{action_kind}_misses"), 1
                 )
             finally:
                 executor.close()
                 path.unlink(missing_ok=True)
+
+    def test_plugin_attack_events_assign_each_fixed_budget_once(self) -> None:
+        for was_hit, expected_budget in (
+            (False, EVADE_SUCCESS_REWARD),
+            (True, EVADE_FAILURE_PENALTY),
+        ):
+            path = Path(f"tests/.real_dqn_attack_event_{was_hit}.jsonl")
+            executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+            online = BranchingDQN()
+            trainer = LiveTrainer(
+                online,
+                BranchingDQN(),
+                torch.optim.AdamW(online.parameters(), lr=1e-4),
+                executor,
+                torch.device("cpu"),
+                random.Random(1),
+            )
+            try:
+                neutral = (0, 1, 0)
+                with patch("hk_rl_DQN.real_dqn.select_action", return_value=neutral):
+                    trainer.observe(with_attack_event(
+                        snapshot("Movement 1", 1),
+                        attack_id=41,
+                        phase="startup",
+                        active=0,
+                    ))
+                    trainer.observe(with_attack_event(
+                        snapshot("Movement 1", 2),
+                        attack_id=41,
+                        phase="active",
+                    ))
+                    trainer.observe(with_attack_event(
+                        snapshot("Movement 1", 3, health=9 if was_hit else 10),
+                        attack_id=41,
+                        phase="active",
+                        hits=int(was_hit),
+                        last_hit_id=41 if was_hit else 0,
+                    ))
+                    trainer.observe(with_attack_event(
+                        snapshot("Movement 1", 4, health=9 if was_hit else 10),
+                        attack_id=0,
+                        phase="idle",
+                        finished=1,
+                        hits=int(was_hit),
+                        last_finished_id=41,
+                        last_hit_id=41 if was_hit else 0,
+                    ))
+                    dodge_count = trainer.metrics.dodges + trainer.metrics.failed_dodges
+                    trainer.observe(with_attack_event(
+                        snapshot("Movement 1", 5, health=9 if was_hit else 10),
+                        attack_id=0,
+                        phase="idle",
+                        finished=1,
+                        hits=int(was_hit),
+                        last_finished_id=41,
+                        last_hit_id=41 if was_hit else 0,
+                    ))
+                self.assertEqual(
+                    trainer.metrics.dodges + trainer.metrics.failed_dodges,
+                    dodge_count,
+                )
+                applied = (
+                    trainer.metrics.evade_failure_backfill_penalty
+                    if was_hit
+                    else trainer.metrics.dodge_backfill_reward
+                )
+                self.assertAlmostEqual(applied, expected_budget)
+            finally:
+                executor.close()
+                path.unlink(missing_ok=True)
+
+    def test_player_hurt_is_credited_to_recent_combat_action(self) -> None:
+        path = Path("tests/.real_dqn_temporal_hurt.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with (
+                patch(
+                    "hk_rl_DQN.real_dqn.branch_availability",
+                    return_value=(ALL_ACTIONS_AVAILABLE, ()),
+                ),
+                patch(
+                    "hk_rl_DQN.real_dqn.select_action",
+                    side_effect=[(0, 0, 1), (0, 0, 0), (0, 0, 0), (0, 0, 0)],
+                ),
+            ):
+                trainer.observe(snapshot("Movement 1", 1, health=10))
+                trainer.observe(snapshot("Movement 1", 2, health=10))
+                trainer.observe(snapshot("Movement 1", 3, health=10))
+                trainer.observe(snapshot("Movement 1", 4, health=9))
+            trainer._finalize_pending(force=True)
+            attack = next(
+                item for item in trainer.replay._items if item.action_vector == (0, 0, 1)
+            )
+            self.assertAlmostEqual(
+                attack.reward,
+                STEP_PENALTY + COMBAT_ACTION_HURT_PENALTY_PER_HP,
+            )
+            self.assertEqual(
+                trainer.metrics.combat_hurt_penalty,
+                COMBAT_ACTION_HURT_PENALTY_PER_HP,
+            )
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_replay_transition_is_immutable_after_pending_finalization(self) -> None:
+        pending = PendingTransition(transition(reward=1.0), created_step=0)
+        pending.add_reward(0.5)
+        replay = ReplayBuffer()
+        replay.append(pending.finalize())
+        stored = replay._items[0]
+        pending.add_reward(99.0)
+        self.assertEqual(stored.reward, 1.5)
+        with self.assertRaises(FrozenInstanceError):
+            stored.reward = 7.0
 
     def test_dry_run_does_not_learn_from_unexecuted_actions(self) -> None:
         path = Path("tests/.real_dqn_dry_run_actions.jsonl")
@@ -882,6 +1152,7 @@ class BranchingDQNTests(unittest.TestCase):
                 trainer.previous_illegal_penalty = ILLEGAL_ACTION_PENALTY
                 trainer.previous_illegal_branches = ("jump_z",)
                 trainer.observe(snapshot("Movement 1", 2))
+            trainer._finalize_pending(force=True)
             self.assertEqual(
                 trainer.replay.sample(1, random.Random(0))[0].reward,
                 STEP_PENALTY + ILLEGAL_ACTION_PENALTY,

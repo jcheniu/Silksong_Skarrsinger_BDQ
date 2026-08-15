@@ -1,4 +1,4 @@
-"""Decode Branching-DQN actions and apply simultaneous keyboard state."""
+"""Decode joint-action vectors and apply simultaneous keyboard state."""
 
 from __future__ import annotations
 
@@ -18,7 +18,7 @@ BRANCH_NAMES = (
     "combat",
 )
 BRANCH_SIZES = (3, 7, 7)
-ACTION_PROTOCOL = "semantic-bdq-v13-harpoon-lock"
+ACTION_PROTOCOL = "semantic-joint-v15-charge-protection"
 BranchMasks = tuple[tuple[bool, ...], ...]
 
 KEYS = {
@@ -102,6 +102,8 @@ def branch_availability(
     snapshot: Mapping[str, object],
     continuing_action: Sequence[int] | None = None,
     harpoon_locked: bool = False,
+    charge_protected: bool = False,
+    charge_must_hold: bool = False,
 ) -> tuple[BranchMasks, tuple[str, ...]]:
     """Build conservative branch masks from optional resource/control telemetry."""
 
@@ -120,6 +122,9 @@ def branch_availability(
     if not resources.can_harpoon_dash:
         masks[1][6] = False
         reasons.append("movement harpoon masked: CanHarpoonDash is false or unavailable")
+    if charge_protected:
+        masks[1][6] = False
+        reasons.append("movement harpoon masked: charge hold/release is protected")
     if not resources.can_quick_cast:
         masks[2][3] = False
         if not resources.is_complete:
@@ -150,6 +155,9 @@ def branch_availability(
     masks[2][2] = attack_available or continuing[2] == 2
     if not attack_available:
         reasons.append("attack start masked: attack_available is false or unavailable")
+    if charge_must_hold:
+        masks[2] = [index == 2 for index in range(BRANCH_SIZES[2])]
+        reasons.append("combat branch locked: incomplete charge must keep holding X")
     return validate_masks(masks), tuple(reasons)
 
 
@@ -278,6 +286,7 @@ class KeyboardActionExecutor:
     send_input: bool = False
     harpoon_active_ms: int = 300
     harpoon_lock_ms: int = 900
+    charge_release_protection_ms: int = 500
 
     def __post_init__(self) -> None:
         if self.tick_ms <= 0:
@@ -287,6 +296,7 @@ class KeyboardActionExecutor:
         self._held_keys: set[str] = set()
         self._charge = ChargeState()
         self._harpoon_lock_remaining_ms = 0
+        self._charge_release_protection_remaining_ms = 0
         self._last_executed = (0,) * len(BRANCH_SIZES)
         self._interrupted = False
         if self.send_input:
@@ -323,7 +333,9 @@ class KeyboardActionExecutor:
             movement_direction=movement_direction,
             movement_mode=movement_mode,
             combat_action=combat_value / 6.0,
-            attack_charge_progress=self._charge.elapsed_ms / self._charge.required_ms,
+            attack_charge_progress=(
+                self._charge.elapsed_ms / self._charge.max_hold_ms
+            ),
             harpoon_phase=harpoon_phase,
         )
 
@@ -335,6 +347,20 @@ class KeyboardActionExecutor:
     def harpoon_locked(self) -> bool:
         return self._harpoon_lock_remaining_ms > 0
 
+    @property
+    def charge_protected(self) -> bool:
+        return (
+            self._charge.active
+            or self._charge_release_protection_remaining_ms > 0
+        )
+
+    @property
+    def charge_must_hold(self) -> bool:
+        return (
+            self._charge.active
+            and self._charge.elapsed_ms < self._charge.required_ms
+        )
+
     def apply(
         self,
         action: Sequence[int],
@@ -344,7 +370,9 @@ class KeyboardActionExecutor:
         player_resources: PlayerResources | None = None,
     ) -> dict[str, object]:
         attempted = validate_action(action)
+        charge_was_active = self._charge.active
         charge_was_complete = self._charge.elapsed_ms >= self._charge.required_ms
+        charge_was_at_max = self._charge.elapsed_ms >= self._charge.max_hold_ms
         masks = validate_masks(branch_masks) if branch_masks is not None else None
         illegal_branches: tuple[str, ...] = ()
         if masks is not None:
@@ -368,9 +396,23 @@ class KeyboardActionExecutor:
             values = (0,) * len(BRANCH_SIZES)
         else:
             adjusted = list(values)
-            if adjusted[2] == 2 and charge_was_complete:
+            if charge_was_active and not charge_was_complete and adjusted[2] != 2:
+                adjusted[2] = 2
+                adjusted_reasons.append(
+                    "incomplete charge forced combat branch to keep holding X"
+                )
+            if adjusted[1] == 6 and (
+                charge_was_active
+                or adjusted[2] == 2
+                or self._charge_release_protection_remaining_ms > 0
+            ):
+                adjusted[1] = 0
+                adjusted_reasons.append(
+                    "charge hold/release protection suppressed harpoon"
+                )
+            if adjusted[2] == 2 and charge_was_at_max:
                 adjusted[2] = 0
-                adjusted_reasons.append("completed charge released combat branch")
+                adjusted_reasons.append("maximum charge duration released combat branch")
             if adjusted[1] == 6:
                 harpoon_started = True
                 if adjusted[0] != 0 or adjusted[2] != 0:
@@ -418,6 +460,7 @@ class KeyboardActionExecutor:
         self._interrupted = interrupted
         if interrupted:
             self._harpoon_lock_remaining_ms = 0
+            self._charge_release_protection_remaining_ms = 0
         elif harpoon_started:
             self._harpoon_lock_remaining_ms = max(0, self.harpoon_lock_ms - self.tick_ms)
         elif lock_was_active:
@@ -431,6 +474,15 @@ class KeyboardActionExecutor:
         charge_released = (
             not interrupted and charge_was_complete and values[2] != 2
         )
+        if charge_released:
+            self._charge_release_protection_remaining_ms = (
+                self.charge_release_protection_ms
+            )
+        elif self._charge_release_protection_remaining_ms > 0:
+            self._charge_release_protection_remaining_ms = max(
+                0,
+                self._charge_release_protection_remaining_ms - self.tick_ms,
+            )
         if values[2] in (1, 5, 6) or charge_released:
             started_branches.append("attack_x")
         if harpoon_started:
@@ -470,6 +522,7 @@ class KeyboardActionExecutor:
                 _send_key(key, True)
         self._held_keys.clear()
         self._harpoon_lock_remaining_ms = 0
+        self._charge_release_protection_remaining_ms = 0
         self._last_executed = (0,) * len(BRANCH_SIZES)
         self._interrupted = True
         self._charge.step(False, self.tick_ms, interrupted=True)

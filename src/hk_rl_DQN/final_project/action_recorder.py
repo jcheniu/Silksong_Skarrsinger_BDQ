@@ -16,6 +16,7 @@ from .action_catalog import ACTION_NAMES, get_action
 class ChargeState:
     """Tracks X held across control frames; omission or interruption releases it."""
     required_ms: int = 1350
+    max_hold_ms: int = 3000
     elapsed_ms: int = 0
     active: bool = False
 
@@ -24,10 +25,19 @@ class ChargeState:
             self.elapsed_ms = 0
             self.active = False
         else:
-            self.elapsed_ms += max(0, duration_ms)
+            self.elapsed_ms = min(
+                self.max_hold_ms,
+                self.elapsed_ms + max(0, duration_ms),
+            )
             self.active = True
-        return {"charge_elapsed_ms": self.elapsed_ms, "charge_required_ms": self.required_ms,
-                "charge_completed": self.elapsed_ms >= self.required_ms, "interrupted": interrupted}
+        return {
+            "charge_elapsed_ms": self.elapsed_ms,
+            "charge_required_ms": self.required_ms,
+            "charge_max_hold_ms": self.max_hold_ms,
+            "charge_completed": self.elapsed_ms >= self.required_ms,
+            "charge_at_max": self.elapsed_ms >= self.max_hold_ms,
+            "interrupted": interrupted,
+        }
 
 
 class ActionRecorder:

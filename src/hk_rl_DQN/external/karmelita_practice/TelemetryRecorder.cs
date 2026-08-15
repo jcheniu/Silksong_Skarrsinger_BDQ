@@ -54,6 +54,7 @@ internal sealed class TelemetryRecorder : IDisposable
         json.Append($",\"sequence\":{sequence++},\"timestamp\":{Number(Time.realtimeSinceStartup)}");
         json.Append($",\"frame\":{Time.frameCount},\"scene\":{Quote(scene)}");
         json.Append($",\"encounter_active\":{Bool(plugin.IsEncounterActive)}");
+        json.Append($",\"encounter_id\":{plugin.EncounterId}");
         json.Append(",\"player_grounded\":");
         json.Append(hero != null ? Bool(hero.cState.onGround) : "null");
         json.Append(",\"player\":");
@@ -76,6 +77,16 @@ internal sealed class TelemetryRecorder : IDisposable
         json.Append($",\"boss_damage_events\":{bossDamageEvents}");
         json.Append($",\"boss_damage_total\":{bossDamageTotal}");
         json.Append($",\"player_parry_events\":{plugin.PlayerParryEvents}");
+        json.Append(",\"boss_attack\":{");
+        json.Append($"\"id\":{plugin.ActiveBossAttackId}");
+        json.Append($",\"type\":{Quote(plugin.ActiveBossAttackType)}");
+        json.Append($",\"phase\":{Quote(plugin.ActiveBossAttackPhase)}");
+        json.Append($",\"started_events\":{plugin.BossAttackStartedEvents}");
+        json.Append($",\"active_events\":{plugin.BossAttackActiveEvents}");
+        json.Append($",\"finished_events\":{plugin.BossAttackFinishedEvents}");
+        json.Append($",\"player_hit_events\":{plugin.BossAttackPlayerHitEvents}");
+        json.Append($",\"last_finished_id\":{plugin.LastFinishedBossAttackId}");
+        json.Append($",\"last_player_hit_id\":{plugin.LastPlayerHitBossAttackId}}}");
         json.Append(",\"fsm\":[");
         bool first = true;
         foreach (PlayMakerFSM fsm in Resources.FindObjectsOfTypeAll<PlayMakerFSM>())

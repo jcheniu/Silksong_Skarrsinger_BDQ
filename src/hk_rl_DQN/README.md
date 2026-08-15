@@ -1,4 +1,4 @@
-# Live Branching DQN
+# Live Joint-Action DQN
 
 `hk_rl_DQN` is now the real-game Karmelita training pipeline. The old
 single-action simulator implementation is archived under
@@ -13,9 +13,9 @@ The live pipeline is split by responsibility:
 - `real_reward.py`: event reward calculation. Confirmed hit events are derived
   from a decrease in the game's Boss `HealthManager.hp`, but raw Boss HP is
   never exposed to the DQN observation.
-- `final_project/action_executor.py`: three independent BDQ action branches,
+- `final_project/action_executor.py`: three coordinated action fields,
   legality masks, held-key timing, and JSONL action records.
-- `real_dqn.py`: Branching Dueling Double DQN, replay, checkpoints, and the
+- `real_dqn.py`: 147-action Dueling Double DQN, replay, checkpoints, and the
   telemetry training loop.
 - `tools/`: explicit cold-start state/action acceptance tests.
 
@@ -24,8 +24,9 @@ The fixed action vector is `[3,7,7]` in this order: `jump_z, movement, combat`.
 double jump, and cloak hover are not separate actions. `movement` chooses
 neutral, held left/right, dash, a directed left/right dash, or S harpoon dash.
 `combat` chooses neutral, tap X, hold X, press Shift, hold V, up+X, or down+X.
-The three heads normally act simultaneously while values within one head remain
-mutually exclusive. Harpoon dash is the deliberate exception: S is pulsed for
+The three fields are combined into one of `3 * 7 * 7 = 147` joint actions and
+receive one Q-value. Values within one field remain mutually exclusive.
+Harpoon dash is the deliberate exception: S is pulsed for
 one tick, jump/combat are neutralized on launch, and all heads remain neutral
 during its active/recovery lock. There is no dedicated wall-jump or sustained-run action.
 Healing key `A` is deliberately absent from the action space and all input
@@ -77,27 +78,58 @@ ability-disable state, harpoon availability, and quick-cast availability.
 `CanHarpoonDash()` result and does not require silk;
 `spell_shift` is masked when silk is insufficient or the action is unavailable.
 
-The current reward protocol is `three-head-harpoon-movement-v14`.
-Exploration starts at `0.60`, decays to `0.03` over 15,000 steps, and samples
-sparse legal branch combinations instead of uniformly randomizing every branch.
+The current reward protocol is `event-ledger-joint-action-v16`.
+The first 2,000 executed transitions use pure weighted exploration. Replay
+training starts at 1,000 transitions, so the network receives roughly 1,000
+gradient updates before greedy actions can influence play. After transition
+2,000, epsilon starts at `0.60` and decays to `0.03` over 15,000 further
+steps. Exploration samples sparse legal branch combinations instead of
+uniformly randomizing every branch.
 Movement exploration weights left/right at 32% each, dash at 12%, directed
 dashes at 8% each, and S at 8%. Exploratory left/right actions persist for a
-total of 2-3 control ticks.
-Boss attack types separated by less than 0.25 seconds form one hurt-sensitive
-combo window. Damage is credited back to recent X/S/Shift start events. Dodge
-credit trains the jump and movement heads. If the player loses health anywhere
-in the complete attack/combo window, those same heads instead receive failed
-dodge backfill of `-0.5 * 0.9^distance` on every buffered transition in the
-window. The ordinary `-3.0` per lost player HP remains a common reward for all
-heads. Taunt, silk, illegal-action, and offensive miss penalties train only
-their responsible heads. X, completed charge releases, and Shift each receive
+total of 2-3 control ticks. Combat exploration weights tap X, hold X, Shift,
+taunt, up+X, and down+X as `30/8/8/1/20/20`, keeping taunt available without
+letting it dominate cold-start data.
+The plugin emits monotonic Boss `attack_id` events. Each completed active attack
+receives exactly one normalized joint-action budget: `+0.8` when the whole
+window is avoided and `-1.0` when it hits Hornet. The budget is distributed
+across the actions observed during that attack instead of growing with attack
+duration. Damage is credited back to recent X/S/Shift start events. Player
+damage also applies `-3.0` per lost HP across recent non-neutral combat actions
+within an eight-tick temporal window, reported as `combat_hurt_penalty`.
+X, completed charge releases, and Shift each receive
 `-0.5` if their 20-tick result window expires without Boss HP loss or a
-successful player parry. S damage trains the movement head, but an S movement
+successful player parry. S damage trains its joint action, but an S movement
 that deals no damage is not treated as an offensive miss. Telemetry counts
 `HeroController.NailParry()` events. A new event inside a Boss attack/combo window
-gives `+2.0` to the most recent X attack transition in the combat head. The
+gives `+2.0` to the most recent X attack transition. The
 Boss `blocked` reaction is not used for this reward. Replay stores the executor's
-actual action after smoothing and temporal fragments. BDQ computes a TD loss
-for each active head instead of fitting only their mean. Use `--reset` because
-checkpoint version 20 persists Replay Buffer contents alongside the compact
-24-value state model.
+actual action after smoothing and temporal fragments. Delayed outcomes mutate
+only a pending-credit ledger; after the 20-tick attribution horizon, an
+immutable scalar-reward transition is appended to replay. Unattributed damage
+or parry events are reported but do not reinforce the current unrelated action.
+Use `--reset` because checkpoint version 22 changes the network output and
+replay schema; older replay must not be reused.
+
+X charge is valid for a release window rather than one fixed duration. It
+becomes complete at 1,350 ms. With a 100 ms control tick, the first practical
+release decision is at 1,400 ms. It may remain held until 3,000 ms and is
+forced to release at the maximum. S is masked throughout the hold and for 500 ms after a
+completed release, so harpoon movement cannot cancel the charge or its release
+animation. Once charging starts, combat is locked to hold X until the 1,350 ms
+minimum is reached; player damage can still interrupt it. Charge progress is
+elapsed time normalized by the 3,000 ms maximum.
+
+Every completed episode reports `replay_size`, `global_step`,
+`gradient_updates`, `mean_loss`, the executor's `actual_action_counts` for
+each action field, and one `mean_policy_q` for the selected joint action. A null loss with replay below
+1,000 is expected because warmup has not completed. Loss is a moving TD target
+and is not expected to decrease monotonically between episodes.
+
+Telemetry continues during encounter transitions and includes a monotonic
+`encounter_id` for each plugin process. The trainer uses inactive snapshots or
+a changed encounter ID to close and reopen the arena gate. A one-second
+watchdog recovers a healthy new encounter if transition telemetry was missed.
+When a game launched by the trainer exits normally before the requested run is
+complete, the trainer saves replay, breaks the cross-process transition, and
+relaunches it. Repeated rapid exits are capped at three per minute.

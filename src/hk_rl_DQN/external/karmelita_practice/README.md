@@ -33,10 +33,19 @@ file is:
 
 `BepInEx/plugins/hollow-knight-rl-KarmelitaPractice/telemetry.jsonl`
 
-Each snapshot contains the active scene, frame/timestamp, encounter status,
+Each snapshot contains the active scene, frame/timestamp, encounter status and
+`encounter_id`,
 player and Boss position/velocity, player health/resources, cumulative player
 `NailParry()` events, and the Boss-tree and challenge PlayMaker FSMs with their
 hierarchy path, name, and current state.
+The `boss_attack` object provides a monotonic attack ID, semantic type and
+phase, cumulative start/active/finish/player-hit counters, and the most recent
+finished and player-hit IDs. The trainer uses these lifecycle events to settle
+one fixed dodge budget per attack instead of inferring credit from sample count.
+Snapshots continue while the plugin is enabled but the encounter is inactive
+or transitioning. `encounter_id` increments whenever a newly loaded Boss
+encounter becomes active, allowing the trainer to distinguish a fresh fight
+from lingering terminal frames even if an inactive sample is missed.
 Sampling defaults to 100 ms. The settings are generated in the plugin config:
 
 ```json
@@ -68,6 +77,5 @@ Enabled = true
 IntervalSeconds = 0.1
 ```
 
-This first recorder is intentionally read-only. Boss health, FSM variables,
-attack hitboxes, and action-level event labels are not inferred until the
-snapshot stream has been inspected in a live encounter.
+The recorder remains read-only. It observes FSM state and game events without
+changing Boss health, FSM variables, hitboxes, or encounter behavior.
