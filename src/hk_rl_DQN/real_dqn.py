@@ -7,6 +7,7 @@ from collections import deque
 from dataclasses import asdict, dataclass, field, replace
 from itertools import product
 import json
+import math
 from pathlib import Path
 import random
 import subprocess
@@ -25,30 +26,38 @@ from .final_project.action_executor import (
     KeyboardActionExecutor,
     branch_availability,
     find_game_window,
+    place_game_window_top_left_quarter,
     validate_action,
     validate_masks,
 )
 from .final_project.action_recorder import ActionRecorder
 from .real_reward import DODGE_REWARD, ILLEGAL_ACTION_PENALTY, RewardFrame, RewardTracker
-from .real_state import STATE_DIMENSIONS, StateFrame, encode_snapshot
+from .real_state import (
+    ARENA_CENTER_X,
+    ARENA_HALF_WIDTH,
+    STATE_DIMENSIONS,
+    StateFrame,
+    encode_snapshot,
+)
 
 
-STATE_ENCODING = "real-telemetry-state-v12-charge-window-24"
+STATE_ENCODING = "real-telemetry-state-v13-taunt-lock-24"
 ALGORITHM = "joint-dueling-double-dqn"
-CHECKPOINT_VERSION = 23
+CHECKPOINT_VERSION = 28
 REPLAY_CHECKPOINT_VERSION = 2
-REWARD_PROTOCOL = "opportunity-gated-credit-v17"
+REWARD_PROTOCOL = "normalized-evade-budget-v22-evaluation"
 HIDDEN_DIMENSIONS = (96, 96)
 LEARNING_RATE = 1e-4
 GAMMA = 0.99
 BATCH_SIZE = 128
 REPLAY_CAPACITY = 50_000
 REPLAY_WARMUP = 1_000
-PURE_EXPLORATION_STEPS = 2_000
+PURE_EXPLORATION_STEPS = 0  # Compatibility only; exploration now decays by episode.
 TARGET_UPDATE_INTERVAL = 500
 EPSILON_START = 0.60
-EPSILON_END = 0.03
-EPSILON_DECAY_STEPS = 15_000
+EPSILON_END = 0.02
+EPSILON_DECAY_TRANSITIONS = 150_000
+EPSILON_RECIPROCAL_SHAPE = 3.0
 EXPLORATION_ACTIVATION_RATES = (0.45, 0.85, 0.30)
 MOVEMENT_EXPLORATION_WEIGHTS = (0.0, 32.0, 32.0, 12.0, 8.0, 8.0, 8.0)
 COMBAT_EXPLORATION_WEIGHTS = (0.0, 30.0, 8.0, 8.0, 1.0, 20.0, 20.0)
@@ -66,18 +75,30 @@ ACTION_LABELS = (
     ("neutral", "tap_x", "hold_x", "shift", "taunt_v", "up_x", "down_x"),
 )
 COMBAT_HURT_EVENT_PENALTY = -0.75
-EVADE_SUCCESS_REWARD = 0.2
+EVADE_SUCCESS_REWARD = 0.6
 EVADE_FAILURE_PENALTY = -1.0
+ATTACK_END_GRACE_SECONDS = 0.7
 COMBAT_HURT_CREDIT_WINDOW_STEPS = 6
 CREDIT_FINALIZATION_STEPS = DAMAGE_CREDIT_WINDOW_STEPS = 20
 ATTACK_ANIMATION_COMMITMENT_STEPS = 2
 CHARGE_RELEASE_COMMITMENT_STEPS = 5
 SPELL_ANIMATION_COMMITMENT_STEPS = 3
-TAUNT_OUTCOME_WINDOW_STEPS = 6
 TAUNT_STEP_PENALTY = -0.02
 TAUNT_MISS_PENALTY = 0.0
-TAUNT_HURT_PENALTY = -1.0
-OFFENSIVE_MISS_PENALTY = -0.5
+TAUNT_HURT_PENALTY_PER_HP = -1.0
+ATTACK_MISS_PENALTY = -0.25
+SPELL_MISS_PENALTY = -0.5
+LONG_NO_DAMAGE_STEPS = 50
+LONG_NO_DAMAGE_PENALTY = -0.05
+STAGNATION_WINDOW_STEPS = 10
+STAGNATION_REGION_FRACTION = 0.1
+STAGNATION_PENALTY = -0.05
+BOSS_PROXIMITY_REWARD = 0.005
+BOSS_PROXIMITY_X = 12.0
+BOSS_PROXIMITY_Y = 8.0
+ARENA_BOUNDARY_FRACTION = 0.1
+ARENA_BOUNDARY_PENALTY = -0.02
+EVALUATION_INTERVAL_EPISODES = 10
 GRADIENT_CLIP_NORM = 10.0
 BRANCH_INDEX = {name: index for index, name in enumerate(BRANCH_NAMES)}
 JOINT_ACTIONS = tuple(product(*(range(size) for size in BRANCH_SIZES)))
@@ -129,6 +150,8 @@ class JointDQN(nn.Module):
         return value + advantage - advantage.mean(dim=-1, keepdim=True)
 
 
+# Compatibility name retained for checkpoints/tests; the model has one
+# coordinated 147-action advantage output, not three independent Q heads.
 BranchingDQN = JointDQN
 
 
@@ -146,8 +169,21 @@ def joint_action_mask(branch_masks: BranchMasks) -> tuple[bool, ...]:
     masks = validate_masks(branch_masks)
     return tuple(
         all(masks[index][value] for index, value in enumerate(action))
+        and not (action[1] == 6 and (action[0] != 0 or action[2] != 0))
+        and not (action[2] == 4 and (action[0] != 0 or action[1] != 0))
         for action in JOINT_ACTIONS
     )
+
+
+def coordinate_temporal_action(action: Sequence[int]) -> tuple[int, ...]:
+    """Canonicalize atomic temporal actions before they reach the executor."""
+
+    jump, movement, combat = validate_action(action)
+    if movement == 6:
+        return (0, 6, 0)
+    if combat == 4:
+        return (0, 0, 4)
+    return jump, movement, combat
 
 
 def _entity_value(entity: Mapping[str, object] | None, name: str) -> float:
@@ -279,7 +315,7 @@ class Transition:
 @dataclass
 class TauntTrial:
     pending: "PendingTransition"
-    remaining_steps: int = TAUNT_OUTCOME_WINDOW_STEPS
+    remaining_steps: int
 
 
 @dataclass
@@ -307,6 +343,7 @@ class CombatRiskTrial:
 class PendingTransition:
     transition: Transition
     created_step: int
+    macro_id: int = 0
     attack_ids: set[int] = field(default_factory=set)
     delayed_reward: float = 0.0
 
@@ -326,6 +363,7 @@ class BossAttackCreditWindow:
     attack_type: str = "unknown"
     active_seen: bool = False
     hurt_player: bool = False
+    finished_step: int | None = None
     transitions: list[PendingTransition] = field(default_factory=list)
 
 
@@ -541,11 +579,14 @@ class ReplayBuffer:
             )
 
 
-def epsilon_for_step(step: int) -> float:
-    fraction = min(1.0, max(0, step) / EPSILON_DECAY_STEPS)
+def epsilon_for_transition(transition: int) -> float:
+    fraction = min(1.0, max(0, transition) / EPSILON_DECAY_TRANSITIONS)
     if fraction >= 1.0:
         return EPSILON_END
-    return EPSILON_START + fraction * (EPSILON_END - EPSILON_START)
+    floor = 1.0 / (1.0 + EPSILON_RECIPROCAL_SHAPE)
+    reciprocal = 1.0 / (1.0 + EPSILON_RECIPROCAL_SHAPE * fraction)
+    normalized = (reciprocal - floor) / (1.0 - floor)
+    return EPSILON_END + (EPSILON_START - EPSILON_END) * normalized
 
 
 def _weighted_exploration_choice(
@@ -631,7 +672,7 @@ def select_action(
                     action.append(rng.choice(non_neutral))
             else:
                 action.append(0 if 0 in available else rng.choice(available))
-        selected_action = tuple(action)
+        selected_action = coordinate_temporal_action(action)
         selected_id = joint_action_id(selected_action)
     else:
         scores = values.squeeze(0).clone()
@@ -850,6 +891,7 @@ class TelemetryTail:
 @dataclass
 class EpisodeMetrics:
     episode: int
+    evaluation: bool = False
     steps: int = 0
     reward: float = 0.0
     gradient_updates: int = 0
@@ -898,6 +940,14 @@ class EpisodeMetrics:
     failed_dodges_by_attack: dict[str, int] = field(default_factory=dict)
     illegal_actions: int = 0
     illegal_action_penalty: float = 0.0
+    macro_hurt_penalty: float = 0.0
+    long_no_damage_events: int = 0
+    long_no_damage_penalty: float = 0.0
+    stagnation_events: int = 0
+    stagnation_penalty: float = 0.0
+    boss_proximity_reward: float = 0.0
+    boundary_events: int = 0
+    boundary_penalty: float = 0.0
 
     def as_dict(
         self,
@@ -1023,11 +1073,144 @@ class LiveTrainer:
         self.attack_events_initialized = False
         self.action_exploration_state = ActionExplorationState()
         self.metrics = EpisodeMetrics(episode=episodes + 1)
+        self.previous_macro_id = 0
+        self.current_macro_key: tuple[str, int] | None = None
+        self.next_macro_id = 1
+        self.recent_macro_ids: deque[int] = deque(maxlen=2)
+        self.current_macro_positions: deque[float] = deque(
+            maxlen=STAGNATION_WINDOW_STEPS + 1
+        )
+        self.no_damage_steps = 0
+        self.episode_finalized_reward = 0.0
+        self.credit_step = 0
+        self.evaluation_mode = False
+        self.proximity_reward_available = True
+        self.was_inside_boss_proximity = False
+        self.attack_end_grace_steps = max(
+            1, math.ceil(ATTACK_END_GRACE_SECONDS * 1000.0 / self.executor.tick_ms)
+        )
 
     def current_epsilon(self) -> float:
-        if self.global_step < PURE_EXPLORATION_STEPS:
-            return 1.0
-        return epsilon_for_step(self.global_step - PURE_EXPLORATION_STEPS)
+        if self.evaluation_mode:
+            return 0.0
+        return epsilon_for_transition(self.global_step)
+
+    def start_evaluation(self) -> None:
+        if self.previous_state is not None:
+            raise RuntimeError("cannot start evaluation during an active episode")
+        self.evaluation_mode = True
+        self.metrics = EpisodeMetrics(
+            episode=self.completed_episodes,
+            evaluation=True,
+        )
+
+    @staticmethod
+    def _macro_key(
+        action: tuple[int, ...], temporal_owner: str | None = None
+    ) -> tuple[str, int]:
+        jump, movement, combat = action
+        if temporal_owner == "taunt_v":
+            return ("combat", 4)
+        if temporal_owner == "skill_s":
+            return ("movement", 6)
+        if combat != 0:
+            return ("combat", combat)
+        if movement != 0:
+            return ("movement", movement)
+        if jump != 0:
+            return ("jump", jump)
+        return ("neutral", 0)
+
+    def _record_macro_action(
+        self,
+        action: tuple[int, ...],
+        temporal_owner: str | None,
+        player_x: float,
+    ) -> None:
+        key = self._macro_key(action, temporal_owner)
+        if key != self.current_macro_key:
+            self.current_macro_key = key
+            self.previous_macro_id = self.next_macro_id
+            self.next_macro_id += 1
+            self.recent_macro_ids.append(self.previous_macro_id)
+            self.current_macro_positions.clear()
+            self.current_macro_positions.append(player_x)
+
+    def _apply_player_hurt_credit(self, reward: RewardFrame) -> None:
+        if reward.player_hurt >= 0:
+            return
+        macro_ids = set(self.recent_macro_ids)
+        candidates = [
+            item
+            for item in self.pending_credit_transitions
+            if item.macro_id in macro_ids
+        ]
+        if not candidates:
+            return
+        share = reward.player_hurt / len(candidates)
+        for item in candidates:
+            item.add_reward(share)
+        self.metrics.macro_hurt_penalty += reward.player_hurt
+        self.metrics.reward += reward.player_hurt
+
+    @staticmethod
+    def _inside_boss_proximity(state: StateFrame) -> bool:
+        if state.player is None or state.boss is None:
+            return False
+        dx = abs(_entity_value(state.boss, "x") - _entity_value(state.player, "x"))
+        dy = abs(_entity_value(state.boss, "y") - _entity_value(state.player, "y"))
+        inside_large_zone = dx <= BOSS_PROXIMITY_X and dy <= BOSS_PROXIMITY_Y
+        inside_close_zone = dx <= 6.0 and dy <= 5.0
+        return inside_large_zone and not inside_close_zone
+
+    def _apply_dense_shaping(
+        self,
+        reward: RewardFrame,
+        state: StateFrame,
+        pending: PendingTransition,
+    ) -> None:
+        if reward.damage_deal > 0:
+            self.no_damage_steps = 0
+            self.proximity_reward_available = True
+        else:
+            self.no_damage_steps += 1
+            if self.no_damage_steps % LONG_NO_DAMAGE_STEPS == 0:
+                pending.add_reward(LONG_NO_DAMAGE_PENALTY)
+                self.metrics.long_no_damage_events += 1
+                self.metrics.long_no_damage_penalty += LONG_NO_DAMAGE_PENALTY
+                self.metrics.reward += LONG_NO_DAMAGE_PENALTY
+
+        inside_proximity = self._inside_boss_proximity(state)
+        entered_proximity = inside_proximity and not self.was_inside_boss_proximity
+        if entered_proximity and self.proximity_reward_available:
+            pending.add_reward(BOSS_PROXIMITY_REWARD)
+            self.metrics.boss_proximity_reward += BOSS_PROXIMITY_REWARD
+            self.metrics.reward += BOSS_PROXIMITY_REWARD
+            self.proximity_reward_available = False
+        self.was_inside_boss_proximity = inside_proximity
+
+        player_x = _entity_value(state.player, "x")
+        normalized_player_x = abs((player_x - ARENA_CENTER_X) / ARENA_HALF_WIDTH)
+        boundary_threshold = 1.0 - 2.0 * ARENA_BOUNDARY_FRACTION
+        if normalized_player_x >= boundary_threshold:
+            pending.add_reward(ARENA_BOUNDARY_PENALTY)
+            self.metrics.boundary_events += 1
+            self.metrics.boundary_penalty += ARENA_BOUNDARY_PENALTY
+            self.metrics.reward += ARENA_BOUNDARY_PENALTY
+        self.current_macro_positions.append(player_x)
+        movement = pending.transition.action_vector[BRANCH_INDEX["movement"]]
+        arena_width = 2.0 * ARENA_HALF_WIDTH
+        stagnant = (
+            movement in (1, 2, 4, 5)
+            and len(self.current_macro_positions) == self.current_macro_positions.maxlen
+            and max(self.current_macro_positions) - min(self.current_macro_positions)
+            <= arena_width * STAGNATION_REGION_FRACTION
+        )
+        if stagnant:
+            pending.add_reward(STAGNATION_PENALTY)
+            self.metrics.stagnation_events += 1
+            self.metrics.stagnation_penalty += STAGNATION_PENALTY
+            self.metrics.reward += STAGNATION_PENALTY
 
     def _apply_taunt_outcomes(self, reward: RewardFrame) -> None:
         if not self.taunt_trials:
@@ -1035,7 +1218,9 @@ class LiveTrainer:
         remaining: list[TauntTrial] = []
         for trial in self.taunt_trials:
             if reward.player_damage_taken > 0:
-                penalty = TAUNT_HURT_PENALTY
+                penalty = (
+                    TAUNT_HURT_PENALTY_PER_HP * reward.player_damage_taken
+                )
                 self.metrics.taunt_hurts += 1
             else:
                 trial.remaining_steps -= 1
@@ -1094,10 +1279,15 @@ class LiveTrainer:
                 )
 
     def _penalize_offensive_miss(self, trial: ActionOutcomeTrial) -> None:
-        trial.pending.add_reward(OFFENSIVE_MISS_PENALTY)
-        self.metrics.reward += OFFENSIVE_MISS_PENALTY
+        penalty = (
+            ATTACK_MISS_PENALTY
+            if trial.action_kind == "attack"
+            else SPELL_MISS_PENALTY
+        )
+        trial.pending.add_reward(penalty)
+        self.metrics.reward += penalty
         self.metrics.offensive_misses += 1
-        self.metrics.offensive_miss_penalty += OFFENSIVE_MISS_PENALTY
+        self.metrics.offensive_miss_penalty += penalty
         if trial.action_kind == "attack":
             self.metrics.attack_misses += 1
             self.metrics.confirmed_range_misses += 1
@@ -1233,31 +1423,27 @@ class LiveTrainer:
             item.attack_ids.discard(attack_id)
         if not unique or not window.active_seen:
             return
-        eligible = (
-            unique
-            if window.hurt_player
-            else [
-                item
-                for item in unique
-                if self._successful_evade_action(item.transition.action_vector)
-            ]
-        )
-        budget = EVADE_FAILURE_PENALTY if window.hurt_player else EVADE_SUCCESS_REWARD
-        weights = [
-            (
+        if window.hurt_player:
+            weights = [
                 self._failed_evade_weight(item.transition.action_vector)
-                if window.hurt_player
-                else self._attack_credit_weight(item.transition.action_vector)
-            )
-            for item in eligible
-        ]
-        total_weight = sum(weights)
-        applied_budget = budget if total_weight > 0 else 0.0
-        if total_weight > 0:
-            for item, weight in zip(eligible, weights):
-                item.add_reward(budget * weight / total_weight)
+                for item in unique
+            ]
+            total_weight = sum(weights)
+            applied_budget = EVADE_FAILURE_PENALTY if total_weight > 0 else 0.0
+            if total_weight > 0:
+                for item, weight in zip(unique, weights):
+                    item.add_reward(EVADE_FAILURE_PENALTY * weight / total_weight)
         else:
-            self.metrics.unattributed_dodges += 1
+            final_index = max(1, len(unique) - 1)
+            weights = [
+                1.0 - 0.5 * index / final_index
+                for index in range(len(unique))
+            ]
+            total_weight = sum(weights)
+            applied_budget = EVADE_SUCCESS_REWARD if total_weight > 0 else 0.0
+            for item, weight in zip(unique, weights):
+                value = EVADE_SUCCESS_REWARD * weight / total_weight
+                item.add_reward(value)
         if window.hurt_player:
             self.metrics.failed_dodges += 1
             self.metrics.evade_failure_backfill_penalty += applied_budget
@@ -1273,6 +1459,23 @@ class LiveTrainer:
                 self.metrics.dodges_by_attack.get(window.attack_type, 0) + 1
             )
         self.metrics.reward += applied_budget
+
+    def _mark_attack_finished(self, attack_id: int) -> None:
+        if attack_id == 0:
+            return
+        window = self._window(attack_id)
+        if window.finished_step is None:
+            window.finished_step = self.credit_step
+
+    def _resolve_mature_attack_windows(self) -> None:
+        mature = [
+            attack_id
+            for attack_id, window in self.attack_windows.items()
+            if window.finished_step is not None
+            and self.credit_step - window.finished_step >= self.attack_end_grace_steps
+        ]
+        for attack_id in mature:
+            self._resolve_attack_window(attack_id)
 
     @staticmethod
     def _counter(mapping: Mapping[str, object], name: str) -> int:
@@ -1291,6 +1494,10 @@ class LiveTrainer:
         reward: RewardFrame,
         pending: PendingTransition,
     ) -> None:
+        for attack_id, window in tuple(self.attack_windows.items()):
+            if window.finished_step is not None:
+                self._attach_to_attack(pending, attack_id, window.attack_type)
+
         raw = snapshot.get("boss_attack")
         if isinstance(raw, Mapping):
             attack_id = self._counter(raw, "id")
@@ -1318,7 +1525,9 @@ class LiveTrainer:
             if hit_count > self.attack_event_counters["player_hit_events"]:
                 hit_id = self._counter(raw, "last_player_hit_id")
                 if hit_id:
-                    self._window(hit_id).hurt_player = True
+                    late_window = self._window(hit_id)
+                    late_window.hurt_player = True
+                    self._attach_to_attack(pending, hit_id)
             active_count = self._counter(raw, "active_events")
             if active_count > self.attack_event_counters["active_events"]:
                 if attack_id:
@@ -1327,7 +1536,7 @@ class LiveTrainer:
             if finished_count > self.attack_event_counters["finished_events"]:
                 finished_id = self._counter(raw, "last_finished_id")
                 if finished_id:
-                    self._resolve_attack_window(finished_id)
+                    self._mark_attack_finished(finished_id)
             for name in self.attack_event_counters:
                 self.attack_event_counters[name] = self._counter(raw, name)
             self.active_attack_id = attack_id
@@ -1345,7 +1554,7 @@ class LiveTrainer:
             window = self._window(self.active_attack_id, reward.attack_finished)
             window.hurt_player |= reward.attack_hurt_player
             self._attach_to_attack(pending, self.active_attack_id)
-            self._resolve_attack_window(self.active_attack_id)
+            self._mark_attack_finished(self.active_attack_id)
             self.active_attack_id = 0
 
     def _register_combat_risk(self, pending: PendingTransition) -> None:
@@ -1403,11 +1612,21 @@ class LiveTrainer:
         self.combat_risk_trials = remaining
 
     def _finalize_pending(self, force: bool = False) -> None:
+        if force:
+            for attack_id in list(self.attack_windows):
+                self._resolve_attack_window(attack_id)
         retained: deque[PendingTransition] = deque()
         for pending in self.pending_credit_transitions:
-            age = self.global_step - pending.created_step
-            if force or (age >= CREDIT_FINALIZATION_STEPS and not pending.attack_ids):
-                self.replay.append(pending.finalize())
+            age = self.credit_step - pending.created_step
+            ready = (
+                age >= CREDIT_FINALIZATION_STEPS
+                and not pending.attack_ids
+            )
+            if force or ready:
+                finalized = pending.finalize()
+                if not self.evaluation_mode:
+                    self.replay.append(finalized)
+                self.episode_finalized_reward += finalized.reward
             else:
                 retained.append(pending)
         self.pending_credit_transitions = retained
@@ -1449,6 +1668,7 @@ class LiveTrainer:
             snapshot,
             self.executor.continuing_action,
             harpoon_locked=self.executor.harpoon_locked,
+            taunt_locked=self.executor.taunt_locked,
             charge_protected=self.executor.charge_protected,
             charge_must_hold=self.executor.charge_must_hold,
         )
@@ -1462,7 +1682,7 @@ class LiveTrainer:
         if range_reasons:
             self.metrics.out_of_range_attack_frames += 1
         if (
-            self.learning_enabled
+            (self.learning_enabled or self.evaluation_mode)
             and self.previous_state is not None
             and self.previous_action is not None
         ):
@@ -1474,6 +1694,7 @@ class LiveTrainer:
                 - reward.damage_reward
                 - reward.dodge
                 - reward.parry_reward
+                - reward.player_hurt
                 + self.previous_illegal_penalty
                 + taunt_step_penalty
             )
@@ -1485,10 +1706,16 @@ class LiveTrainer:
                 done=reward.terminated,
                 next_action_mask=joint_action_mask(masks),
             )
-            pending = PendingTransition(transition, self.global_step)
+            pending = PendingTransition(
+                transition,
+                self.credit_step,
+                macro_id=self.previous_macro_id,
+            )
             self.pending_credit_transitions.append(pending)
             if self.previous_taunt_started:
-                self.taunt_trials.append(TauntTrial(pending))
+                self.taunt_trials.append(
+                    TauntTrial(pending, self.executor.taunt_outcome_steps)
+                )
             self._register_action_outcome(pending)
             self._register_combat_risk(pending)
             self.metrics.steps += 1
@@ -1510,24 +1737,32 @@ class LiveTrainer:
                 self.metrics.illegal_action_penalty += self.previous_illegal_penalty
             self._apply_taunt_outcomes(reward)
             self._apply_action_outcomes(reward, state)
+            self._apply_player_hurt_credit(reward)
+            self._apply_dense_shaping(reward, state, pending)
+            if reward.player_damage_taken > 0:
+                self.current_macro_key = None
+                self.current_macro_positions.clear()
             self._update_combat_risk_overlap(snapshot, state)
             self._apply_combat_hurt(reward.player_damage_taken)
             self._apply_attack_events(snapshot, state, reward, pending)
+            self._resolve_mature_attack_windows()
             self._age_combat_risks()
-            self.global_step += 1
+            self.credit_step += 1
             self._finalize_pending()
-            if len(self.replay) >= REPLAY_WARMUP:
-                loss = optimize_model(
-                    self.online,
-                    self.target,
-                    self.optimizer,
-                    self.replay.sample(BATCH_SIZE, self.rng),
-                    self.device,
-                )
-                self.metrics.gradient_updates += 1
-                self.metrics.loss_total += loss
-            if self.global_step % TARGET_UPDATE_INTERVAL == 0:
-                self.target.load_state_dict(self.online.state_dict())
+            if not self.evaluation_mode:
+                self.global_step += 1
+                if len(self.replay) >= REPLAY_WARMUP:
+                    loss = optimize_model(
+                        self.online,
+                        self.target,
+                        self.optimizer,
+                        self.replay.sample(BATCH_SIZE, self.rng),
+                        self.device,
+                    )
+                    self.metrics.gradient_updates += 1
+                    self.metrics.loss_total += loss
+                if self.global_step % TARGET_UPDATE_INTERVAL == 0:
+                    self.target.load_state_dict(self.online.state_dict())
 
         if reward.terminated:
             self.metrics.won = reward.boss_dead
@@ -1562,6 +1797,13 @@ class LiveTrainer:
         self.previous_attack_opportunity = opportunity
         executed_action = action_result.get("action_vector", action)
         self.previous_action = validate_action(executed_action)
+        temporal_owner = action_result.get("temporal_owner")
+        player_x = _entity_value(state.player, "x")
+        self._record_macro_action(
+            self.previous_action,
+            str(temporal_owner) if temporal_owner is not None else None,
+            player_x,
+        )
         for branch_index, (branch_name, action_value) in enumerate(
             zip(BRANCH_NAMES, self.previous_action)
         ):
@@ -1574,10 +1816,9 @@ class LiveTrainer:
             self.metrics.policy_q_total += selected_q_values[0]
             self.metrics.policy_q_samples += 1
         self.action_exploration_state.reconcile(self.previous_action)
-        newly_pressed = action_result.get("newly_pressed_keys", ())
-        self.previous_taunt_started = "V" in newly_pressed
         raw_started = action_result.get("started_branches", ())
         self.previous_started_branches = tuple(str(value) for value in raw_started)
+        self.previous_taunt_started = "taunt_v" in self.previous_started_branches
         self.previous_charge_released = bool(
             action_result.get("charge_released", False)
         )
@@ -1591,17 +1832,21 @@ class LiveTrainer:
         return reward
 
     def finish_episode(self) -> dict[str, object]:
+        was_evaluation = self.evaluation_mode
         self._expire_taunt_trials()
         self._expire_action_outcomes()
         for attack_id in list(self.attack_windows):
             self._resolve_attack_window(attack_id)
         self._finalize_pending(force=True)
+        self.metrics.reward = self.episode_finalized_reward
         result = self.metrics.as_dict(
             self.current_epsilon(),
             len(self.replay),
             self.global_step,
         )
-        self.completed_episodes += 1
+        if not was_evaluation:
+            self.completed_episodes += 1
+        self.evaluation_mode = False
         self.executor.release_all()
         self.reward_tracker.reset()
         self.previous_state = None
@@ -1616,6 +1861,15 @@ class LiveTrainer:
         self.combat_risk_trials.clear()
         self.attack_windows.clear()
         self.active_attack_id = 0
+        self.previous_macro_id = 0
+        self.current_macro_key = None
+        self.recent_macro_ids.clear()
+        self.current_macro_positions.clear()
+        self.no_damage_steps = 0
+        self.episode_finalized_reward = 0.0
+        self.credit_step = 0
+        self.proximity_reward_available = True
+        self.was_inside_boss_proximity = False
         self.metrics = EpisodeMetrics(episode=self.completed_episodes + 1)
         return result
 
@@ -1641,7 +1895,19 @@ class LiveTrainer:
         self.previous_charge_released = False
         self.previous_attack_opportunity = None
         self.action_exploration_state.clear()
-        self.metrics = EpisodeMetrics(episode=self.completed_episodes + 1)
+        self.previous_macro_id = 0
+        self.current_macro_key = None
+        self.recent_macro_ids.clear()
+        self.current_macro_positions.clear()
+        self.no_damage_steps = 0
+        self.episode_finalized_reward = 0.0
+        self.credit_step = 0
+        self.proximity_reward_available = True
+        self.was_inside_boss_proximity = False
+        self.metrics = EpisodeMetrics(
+            episode=(self.completed_episodes if self.evaluation_mode else self.completed_episodes + 1),
+            evaluation=self.evaluation_mode,
+        )
 
 
 def append_metric(path: Path, metric: Mapping[str, object]) -> None:
@@ -1725,6 +1991,8 @@ def train_live(args: argparse.Namespace) -> None:
             tick_ms=args.tick_ms,
             send_input=args.execute_actions,
         )
+        if args.execute_actions and not args.full_window:
+            place_game_window_top_left_quarter()
     except Exception:
         if process is not None and process.poll() is None and not args.keep_game:
             process.terminate()
@@ -1741,6 +2009,35 @@ def train_live(args: argparse.Namespace) -> None:
         learning_enabled=args.execute_actions,
         replay=replay,
     )
+
+    def finish_current_episode() -> dict[str, object]:
+        metric = trainer.finish_episode()
+        append_metric(args.metrics, metric)
+        if not bool(metric["evaluation"]):
+            save_checkpoint(
+                args.checkpoint,
+                online,
+                target,
+                optimizer,
+                trainer.global_step,
+                trainer.completed_episodes,
+                args.tick_ms,
+                trainer.replay,
+            )
+        print(json.dumps(metric), flush=True)
+        if (
+            args.execute_actions
+            and not bool(metric["evaluation"])
+            and trainer.completed_episodes % EVALUATION_INTERVAL_EPISODES == 0
+        ):
+            trainer.start_evaluation()
+            print(
+                "starting independent greedy evaluation after "
+                f"training episode {trainer.completed_episodes}",
+                flush=True,
+            )
+        return metric
+
     tail = TelemetryTail(args.telemetry)
     in_arena = False
     reset_gate = ArenaResetGate()
@@ -1751,7 +2048,7 @@ def train_live(args: argparse.Namespace) -> None:
                 "dry-run: actions are logged; keyboard input and learning are disabled",
                 flush=True,
             )
-        while trainer.completed_episodes < args.episodes:
+        while trainer.completed_episodes < args.episodes or trainer.evaluation_mode:
             had_data = False
             for snapshot in tail.read():
                 had_data = True
@@ -1767,19 +2064,7 @@ def train_live(args: argparse.Namespace) -> None:
                 if not is_arena:
                     if in_arena and trainer.previous_state is not None:
                         trainer.observe(snapshot, force_terminal=True)
-                        metric = trainer.finish_episode()
-                        append_metric(args.metrics, metric)
-                        save_checkpoint(
-                            args.checkpoint,
-                            online,
-                            target,
-                            optimizer,
-                            trainer.global_step,
-                            trainer.completed_episodes,
-                            args.tick_ms,
-                            trainer.replay,
-                        )
-                        print(json.dumps(metric), flush=True)
+                        finish_current_episode()
                     in_arena = False
                     reset_gate.allow_snapshot(False, encounter_id)
                     action_watchdog.reset()
@@ -1801,19 +2086,7 @@ def train_live(args: argparse.Namespace) -> None:
                 action_watchdog.record(snapshot_timestamp)
                 reward = trainer.observe(snapshot)
                 if reward.terminated or trainer.metrics.steps >= args.max_episode_steps:
-                    metric = trainer.finish_episode()
-                    append_metric(args.metrics, metric)
-                    save_checkpoint(
-                        args.checkpoint,
-                        online,
-                        target,
-                        optimizer,
-                        trainer.global_step,
-                        trainer.completed_episodes,
-                        args.tick_ms,
-                        trainer.replay,
-                    )
-                    print(json.dumps(metric), flush=True)
+                    finish_current_episode()
                     in_arena = False
                     reset_gate.mark_episode_finished()
             if process is not None and process.poll() is not None:
@@ -1863,6 +2136,8 @@ def train_live(args: argparse.Namespace) -> None:
                         process = subprocess.Popen(
                             [str(args.game_exe)], cwd=str(args.game_exe.parent)
                         )
+                        if args.execute_actions and not args.full_window:
+                            place_game_window_top_left_quarter()
                         print(
                             f"restarted Silksong pid={process.pid}; waiting for "
                             "game window",
@@ -1919,6 +2194,11 @@ def main() -> None:
     )
     parser.add_argument("--launch", action="store_true")
     parser.add_argument("--execute-actions", action="store_true")
+    parser.add_argument(
+        "--full-window",
+        action="store_true",
+        help="leave the game window at its current size instead of using the top-left quarter",
+    )
     parser.add_argument("--keep-game", action="store_true")
     args = parser.parse_args()
     if args.episodes <= 0:

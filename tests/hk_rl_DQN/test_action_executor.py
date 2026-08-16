@@ -10,6 +10,7 @@ from hk_rl_DQN.final_project.action_executor import (
     action_keys,
     branch_availability,
     decode_actions,
+    place_game_window_top_left_quarter,
     validate_action,
 )
 from hk_rl_DQN.final_project.action_recorder import ActionRecorder
@@ -22,7 +23,35 @@ ALL_ACTIONS_AVAILABLE = tuple(
 
 
 class ActionExecutorTests(unittest.TestCase):
-    def test_standard_three_head_schema(self) -> None:
+    def test_game_window_uses_top_left_quarter_of_work_area(self) -> None:
+        def populate_work_area(_action, _param, rect_pointer, _flags):
+            rect = action_executor.ctypes.cast(
+                rect_pointer,
+                action_executor.ctypes.POINTER(action_executor.wintypes.RECT),
+            ).contents
+            rect.left = 0
+            rect.top = 0
+            rect.right = 1920
+            rect.bottom = 1040
+            return 1
+
+        with (
+            patch.object(action_executor, "focus_game_window", return_value=1234),
+            patch.object(action_executor.ctypes, "windll") as windll,
+        ):
+            windll.user32.SystemParametersInfoW.side_effect = populate_work_area
+            windll.user32.MoveWindow.return_value = 1
+            self.assertEqual(place_game_window_top_left_quarter(), 1234)
+            windll.user32.MoveWindow.assert_called_once_with(
+                1234,
+                0,
+                0,
+                960,
+                520,
+                True,
+            )
+
+    def test_standard_three_field_schema(self) -> None:
         self.assertEqual(BRANCH_NAMES, ("jump_z", "movement", "combat"))
         self.assertEqual(BRANCH_SIZES, (3, 7, 7))
 
@@ -376,6 +405,25 @@ class ActionExecutorTests(unittest.TestCase):
         )
         self.assertTrue(any("harpoon" in reason for reason in reasons))
 
+    def test_taunt_lock_masks_all_policy_branches(self) -> None:
+        masks, reasons = branch_availability({}, taunt_locked=True)
+        self.assertEqual(
+            masks,
+            tuple(tuple(index == 0 for index in range(size)) for size in BRANCH_SIZES),
+        )
+        self.assertTrue(any("taunt" in reason for reason in reasons))
+
+    def test_taunt_requires_authoritative_game_availability(self) -> None:
+        blocked, reasons = branch_availability(
+            {"player_control": {"taunt_available": False}}
+        )
+        allowed, _ = branch_availability(
+            {"player_control": {"taunt_available": True}}
+        )
+        self.assertFalse(blocked[2][4])
+        self.assertTrue(allowed[2][4])
+        self.assertTrue(any("taunt" in reason for reason in reasons))
+
     def test_charge_protection_masks_harpoon_only(self) -> None:
         masks, reasons = branch_availability({}, charge_protected=True)
         self.assertFalse(masks[1][6])
@@ -391,14 +439,26 @@ class ActionExecutorTests(unittest.TestCase):
         )
         self.assertTrue(any("keep holding" in reason for reason in reasons))
 
-    def test_taunt_has_one_press_edge_while_held(self) -> None:
+    def test_taunt_forces_stationary_launch_and_full_recovery_lock(self) -> None:
         path = Path("tests/.three_head_taunt.jsonl")
-        executor = KeyboardActionExecutor(ActionRecorder(path))
+        executor = KeyboardActionExecutor(ActionRecorder(path), tick_ms=100)
         try:
-            first = executor.apply((0, 0, 4), branch_masks=ALL_ACTIONS_AVAILABLE)
-            held = executor.apply((0, 0, 4), branch_masks=ALL_ACTIONS_AVAILABLE)
+            first = executor.apply((2, 5, 4), branch_masks=ALL_ACTIONS_AVAILABLE)
             self.assertIn("taunt_v", first["started_branches"])
-            self.assertNotIn("taunt_v", held["started_branches"])
+            self.assertEqual(first["action_vector"], [0, 0, 4])
+            self.assertTrue(executor.taunt_locked)
+            self.assertAlmostEqual(executor.control_state({}).combat_action, 4 / 6)
+
+            locked = [
+                executor.apply((2, 2, 1), branch_masks=ALL_ACTIONS_AVAILABLE)
+                for _ in range(9)
+            ]
+            self.assertTrue(all(item["action_vector"] == [0, 0, 0] for item in locked))
+            self.assertFalse(any("taunt_v" in item["started_branches"] for item in locked))
+            self.assertFalse(executor.taunt_locked)
+
+            resumed = executor.apply((0, 1, 0), branch_masks=ALL_ACTIONS_AVAILABLE)
+            self.assertEqual(resumed["action_vector"], [0, 1, 0])
         finally:
             executor.close()
             path.unlink(missing_ok=True)

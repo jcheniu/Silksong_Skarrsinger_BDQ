@@ -17,17 +17,20 @@ The implemented Multi-Discrete executor and joint-action DQN are recorded in
 single-action baseline is preserved under `history/simulator_dqn_v1`.
 
 Boss attacks use plugin-emitted `attack_id` lifecycle events. Each completed
-active attack distributes one fixed `+0.2` eligible-movement success or `-1.0`
-failure budget across its pending joint actions. Replay insertion waits for delayed credit to
-finish, so a sampled transition is immutable and cannot be rewritten later.
+active attack remains open for 400 ms to accept a delayed
+`last_player_hit_id`, then distributes one fixed `+0.5` eligible-movement
+success or `-1.0` failure budget across its pending joint actions. Replay
+insertion waits for delayed credit to finish.
 
 X attacks use three geometric zones. Clearly unreachable actions are masked,
 predictive fringe actions remain legal without miss punishment, and only
 confirmed vulnerable-range actions can receive a completed-animation miss.
+Normal, directional, and completed charged X misses cost `-0.25`; quick-cast
+Shift misses cost `-0.5`.
 Relative velocity predicts the Boss position 150 ms into the attack startup.
 Successful player nail clashes are read from the telemetry
 `player_parry_events` counter, not from the Boss `blocked` FSM reaction. A
-clash inside the Boss attack window gives `+2.0` to the recent X attack action
+clash inside the Boss attack window gives `+0.8` to the recent X attack action
 in the combat head and counts as a productive attack outcome.
 
 The action catalog is in `action_catalog.py`. It uses the local bindings:
@@ -56,11 +59,12 @@ The action catalog is in `action_catalog.py`. It uses the local bindings:
   credited to the movement transition, but an S movement that deals no damage
   is not treated as an offensive miss. Holding S is bounded to 900 ms.
 - `D`: disabled and never sent by the live policy
-- `V`: battle taunt. Live training applies a small held cost and a delayed
-  penalty to the combat-head transition that selected V. Boss damage is not
-  treated as proof that taunting
-  succeeded. Sparse exploration keeps V available without selecting it in
-  half the frames.
+- `V`: battle taunt. The real FSM accepts it only when `CanCast()` is true,
+  Hornet is grounded, and she is not in hard landing. V forces a fixed
+  1,000 ms stationary recovery lock. It launches only as `[0,0,4]`; all later
+  lock ticks are `[0,0,0]`. Damage during the lock adds `-1.0` per lost health point to
+  the one transition that started V. Boss damage is not treated as proof that
+  taunting succeeded.
 
 Healing key `A` is disabled. `Q`, `I`, `Tab`, `J`, and `T` are also
 intentionally excluded.

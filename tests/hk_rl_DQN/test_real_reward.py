@@ -88,9 +88,9 @@ class RewardTrackerTests(unittest.TestCase):
         reward = tracker.step(snapshot(health=8))
         self.assertEqual(reward.player_health_lost, 2)
         self.assertEqual(reward.player_damage_taken, 2)
-        self.assertEqual(PLAYER_DAMAGE_PENALTY_PER_HP, -3.0)
+        self.assertEqual(PLAYER_DAMAGE_PENALTY_PER_HP, -3.6)
         self.assertEqual(PLAYER_HURT_PENALTY, PLAYER_DAMAGE_PENALTY_PER_HP)
-        self.assertEqual(reward.player_hurt, -6.0)
+        self.assertEqual(reward.player_hurt, -7.2)
 
     def test_completed_attack_without_health_loss_rewards_dodge(self) -> None:
         tracker = RewardTracker()
@@ -104,6 +104,7 @@ class RewardTrackerTests(unittest.TestCase):
         reward = tracker.step(snapshot("Movement 1", timestamp=1.6))
         self.assertEqual(reward.attack_finished, "slash")
         self.assertEqual(reward.dodge, DODGE_REWARD)
+        self.assertEqual(DODGE_REWARD, 0.6)
         self.assertFalse(reward.attack_hurt_player)
 
     def test_hurt_during_attack_cancels_dodge(self) -> None:
@@ -115,7 +116,7 @@ class RewardTrackerTests(unittest.TestCase):
         self.assertEqual(reward.dodge, 0.0)
         self.assertTrue(reward.attack_hurt_player)
 
-    def test_player_parry_during_boss_attack_rewards_two(self) -> None:
+    def test_player_parry_during_boss_attack_uses_configured_reward(self) -> None:
         tracker = RewardTracker()
         tracker.step(
             snapshot("Slash Antic", timestamp=1.0, player_parry_events=0)
@@ -125,6 +126,7 @@ class RewardTrackerTests(unittest.TestCase):
         )
         self.assertEqual(reward.player_parries, 1)
         self.assertEqual(reward.parry_reward, PLAYER_PARRY_REWARD)
+        self.assertEqual(PLAYER_PARRY_REWARD, 0.8)
 
     def test_player_parry_counter_outside_boss_attack_is_not_rewarded(self) -> None:
         tracker = RewardTracker()
@@ -165,11 +167,11 @@ class RewardTrackerTests(unittest.TestCase):
         tracker.step(snapshot("Movement 1", boss_damage_total=0))
         five_damage = tracker.step(snapshot("Cyclone Antic", boss_damage_total=5))
         self.assertEqual(five_damage.damage_deal, 5)
-        self.assertEqual(DAMAGE_REWARD_PER_HP, 0.05)
-        self.assertEqual(five_damage.damage_reward, 0.25)
+        self.assertEqual(DAMAGE_REWARD_PER_HP, 0.1)
+        self.assertEqual(five_damage.damage_reward, 0.5)
         twenty_damage = tracker.step(snapshot("Cyclone 1", boss_damage_total=25))
         self.assertEqual(twenty_damage.damage_deal, 20)
-        self.assertEqual(twenty_damage.damage_reward, 1.0)
+        self.assertEqual(twenty_damage.damage_reward, 2.0)
 
     def test_damage_counter_reset_is_only_a_baseline(self) -> None:
         tracker = RewardTracker()
@@ -182,6 +184,7 @@ class RewardTrackerTests(unittest.TestCase):
         tracker.step(snapshot(silk=9))
         reward = tracker.step(snapshot(silk=5))
         self.assertEqual(reward.silk_spent, 4)
+        self.assertEqual(SILK_SPEND_PENALTY_PER_UNIT, -0.04)
         self.assertEqual(reward.silk_penalty, 4 * SILK_SPEND_PENALTY_PER_UNIT)
         self.assertEqual(reward.total, STEP_PENALTY + reward.silk_penalty)
 

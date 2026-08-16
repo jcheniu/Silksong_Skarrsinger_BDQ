@@ -13,25 +13,34 @@ from hk_rl_DQN.final_project.action_executor import (
 from hk_rl_DQN.final_project.action_recorder import ActionRecorder
 from hk_rl_DQN.real_dqn import (
     ActionExplorationState,
+    ARENA_BOUNDARY_PENALTY,
+    ATTACK_MISS_PENALTY,
     ArenaActionWatchdog,
     ArenaResetGate,
     BranchingDQN,
+    BOSS_PROXIMITY_REWARD,
     COMBAT_HURT_EVENT_PENALTY,
     COMBAT_EXPLORATION_WEIGHTS,
     CREDIT_FINALIZATION_STEPS,
     EVADE_FAILURE_PENALTY,
     EVADE_SUCCESS_REWARD,
+    EPSILON_END,
+    EPSILON_DECAY_TRANSITIONS,
+    EPSILON_START,
     JOINT_ACTION_COUNT,
     LiveTrainer,
+    LONG_NO_DAMAGE_PENALTY,
     PendingTransition,
-    PURE_EXPLORATION_STEPS,
     ReplayBuffer,
+    SPELL_MISS_PENALTY,
+    STAGNATION_PENALTY,
     Transition,
     apply_attack_opportunity_mask,
     attack_opportunity,
     checkpoint_metadata,
     decode_joint_action,
     danger_requires_commitment_break,
+    epsilon_for_transition,
     joint_action_id,
     joint_action_mask,
     load_checkpoint,
@@ -75,6 +84,7 @@ def snapshot(state: str, frame: int, health: int = 10) -> dict[str, object]:
         "player_grounded": True,
         "player": {"x": 150.0, "y": 20.0, "velocity_x": 0.0, "velocity_y": 0.0},
         "player_health": {"health": health, "max_health": 10},
+        "player_control": {"taunt_available": True},
         "boss": {"x": 154.0, "y": 20.0, "velocity_x": 0.0, "velocity_y": 0.0},
         "boss_vulnerable": True,
         "fsm": [
@@ -140,6 +150,14 @@ class BranchingDQNTests(unittest.TestCase):
         network = BranchingDQN()
         values = network(torch.zeros(4, STATE_DIMENSIONS))
         self.assertEqual(tuple(values.shape), (4, JOINT_ACTION_COUNT))
+
+    def test_joint_mask_keeps_atomic_temporal_actions_canonical(self) -> None:
+        mask = joint_action_mask(ALL_ACTIONS_AVAILABLE)
+        self.assertTrue(mask[joint_action_id((0, 0, 4))])
+        self.assertFalse(mask[joint_action_id((0, 1, 4))])
+        self.assertFalse(mask[joint_action_id((2, 0, 4))])
+        self.assertTrue(mask[joint_action_id((0, 6, 0))])
+        self.assertFalse(mask[joint_action_id((0, 6, 1))])
 
     def test_random_action_is_valid(self) -> None:
         action = select_action(
@@ -238,7 +256,7 @@ class BranchingDQNTests(unittest.TestCase):
         self.assertGreater(combats.count(4), 0)
         self.assertEqual(len(COMBAT_EXPLORATION_WEIGHTS), BRANCH_SIZES[2])
 
-    def test_cold_start_uses_pure_exploration_before_normal_decay(self) -> None:
+    def test_epsilon_uses_reciprocal_transition_decay(self) -> None:
         path = Path("tests/.real_dqn_epsilon.jsonl")
         executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
         online = BranchingDQN()
@@ -251,11 +269,23 @@ class BranchingDQNTests(unittest.TestCase):
             random.Random(1),
         )
         try:
-            self.assertEqual(trainer.current_epsilon(), 1.0)
-            trainer.global_step = PURE_EXPLORATION_STEPS - 1
-            self.assertEqual(trainer.current_epsilon(), 1.0)
-            trainer.global_step = PURE_EXPLORATION_STEPS
-            self.assertEqual(trainer.current_epsilon(), 0.60)
+            self.assertEqual(trainer.current_epsilon(), EPSILON_START)
+            trainer.global_step = EPSILON_DECAY_TRANSITIONS // 4
+            quarter = trainer.current_epsilon()
+            trainer.global_step = EPSILON_DECAY_TRANSITIONS // 2
+            halfway = trainer.current_epsilon()
+            self.assertLess(quarter, EPSILON_START)
+            self.assertLess(halfway, quarter)
+            self.assertGreater(halfway, EPSILON_END)
+            self.assertGreater(
+                EPSILON_START - quarter,
+                quarter - halfway,
+            )
+            trainer.global_step = EPSILON_DECAY_TRANSITIONS
+            self.assertEqual(trainer.current_epsilon(), EPSILON_END)
+            trainer.global_step = EPSILON_DECAY_TRANSITIONS * 2
+            self.assertEqual(trainer.current_epsilon(), EPSILON_END)
+            self.assertEqual(epsilon_for_transition(0), EPSILON_START)
         finally:
             executor.close()
             path.unlink(missing_ok=True)
@@ -624,6 +654,37 @@ class BranchingDQNTests(unittest.TestCase):
             executor.close()
             path.unlink(missing_ok=True)
 
+    def test_greedy_evaluation_does_not_train_or_advance_progress(self) -> None:
+        path = Path("tests/.real_dqn_evaluation.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+            global_step=5000,
+            episodes=10,
+        )
+        try:
+            trainer.start_evaluation()
+            self.assertEqual(trainer.current_epsilon(), 0.0)
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 0, 0)):
+                for frame in range(1, 6):
+                    trainer.observe(snapshot("Movement 1", frame))
+            result = trainer.finish_episode()
+            self.assertTrue(result["evaluation"])
+            self.assertEqual(result["epsilon"], 0.0)
+            self.assertEqual(result["gradient_updates"], 0)
+            self.assertEqual(trainer.global_step, 5000)
+            self.assertEqual(trainer.completed_episodes, 10)
+            self.assertEqual(len(trainer.replay), 0)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
     def test_inactive_lifecycle_snapshot_writes_terminal_transition(self) -> None:
         path = Path("tests/.real_dqn_lifecycle_terminal.jsonl")
         executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
@@ -730,17 +791,55 @@ class BranchingDQNTests(unittest.TestCase):
             rewards = [item.reward for item in trainer.replay._items]
             self.assertGreater(trainer.metrics.dodge_backfill_reward, 0.0)
             self.assertGreater(sum(rewards), len(rewards) * STEP_PENALTY)
-            self.assertAlmostEqual(trainer.metrics.dodge_backfill_reward, EVADE_SUCCESS_REWARD)
+            self.assertAlmostEqual(
+                trainer.metrics.dodge_backfill_reward,
+                EVADE_SUCCESS_REWARD,
+            )
             self.assertAlmostEqual(
                 sum(item.reward - STEP_PENALTY for item in trainer.replay._items),
-                EVADE_SUCCESS_REWARD,
+                trainer.metrics.dodge_backfill_reward
+                + trainer.metrics.stagnation_penalty
+                + trainer.metrics.boss_proximity_reward,
             )
             self.assertGreater(trainer.metrics.movement_dodge_reward, 0.0)
         finally:
             executor.close()
             path.unlink(missing_ok=True)
 
-    def test_neutral_action_cannot_farm_successful_dodge_reward(self) -> None:
+    def test_successful_dodge_rewards_every_action_with_linear_decay(self) -> None:
+        path = Path("tests/.real_dqn_linear_dodge.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            pendings = [
+                PendingTransition(transition(action=action), created_step=index)
+                for index, action in enumerate(
+                    ((0, 1, 0), (1, 0, 0), (0, 0, 1))
+                )
+            ]
+            window = trainer._window(77, "slash")
+            window.active_seen = True
+            for pending in pendings:
+                trainer._attach_to_attack(pending, 77, "slash")
+            trainer._resolve_attack_window(77)
+            self.assertEqual(
+                [round(item.delayed_reward, 3) for item in pendings],
+                [0.267, 0.2, 0.133],
+            )
+            self.assertAlmostEqual(trainer.metrics.dodge_backfill_reward, 0.6)
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_neutral_action_also_receives_successful_dodge_reward(self) -> None:
         path = Path("tests/.real_dqn_neutral_dodge.jsonl")
         executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
         online = BranchingDQN()
@@ -760,9 +859,14 @@ class BranchingDQNTests(unittest.TestCase):
                 trainer.observe(snapshot("Movement 1", 4))
                 trainer.observe(snapshot("Movement 1", 5))
                 trainer.observe(snapshot("Movement 1", 6))
-            self.assertEqual(trainer.metrics.dodges, 1)
-            self.assertEqual(trainer.metrics.dodge_backfill_reward, 0.0)
-            self.assertEqual(trainer.metrics.unattributed_dodges, 1)
+                trainer.observe(snapshot("Movement 1", 7))
+                trainer.observe(snapshot("Movement 1", 8))
+                trainer.observe(snapshot("Movement 1", 9))
+                trainer.observe(snapshot("Movement 1", 10))
+            result = trainer.finish_episode()
+            self.assertEqual(result["dodges"], 1)
+            self.assertGreater(result["dodge_backfill_reward"], 0.0)
+            self.assertEqual(result["unattributed_dodges"], 0)
         finally:
             executor.close()
             path.unlink(missing_ok=True)
@@ -787,9 +891,14 @@ class BranchingDQNTests(unittest.TestCase):
                 trainer.observe(snapshot("Movement 1", 4, health=9))
                 trainer.observe(snapshot("Movement 1", 5, health=9))
                 trainer.observe(snapshot("Movement 1", 6, health=9))
-            self.assertEqual(trainer.metrics.failed_dodges, 1)
+                trainer.observe(snapshot("Movement 1", 7, health=9))
+                trainer.observe(snapshot("Movement 1", 8, health=9))
+                trainer.observe(snapshot("Movement 1", 9, health=9))
+                trainer.observe(snapshot("Movement 1", 10, health=9))
+            result = trainer.finish_episode()
+            self.assertEqual(result["failed_dodges"], 1)
             self.assertEqual(
-                trainer.metrics.evade_failure_backfill_penalty,
+                result["evade_failure_backfill_penalty"],
                 EVADE_FAILURE_PENALTY,
             )
         finally:
@@ -856,6 +965,7 @@ class BranchingDQNTests(unittest.TestCase):
         cases = (
             ("miss", {}, -0.02),
             ("hurt", {"health": 9}, -1.02),
+            ("hurt_two_hp", {"health": 8}, -2.02),
             ("hit", {"boss_damage_total": 10}, -0.02),
             ("hit_and_hurt", {"health": 9, "boss_damage_total": 10}, -1.02),
         )
@@ -865,10 +975,13 @@ class BranchingDQNTests(unittest.TestCase):
             try:
                 first = snapshot("Movement 1", 1)
                 first["boss_damage_total"] = 0
-                with patch("hk_rl_DQN.real_dqn.select_action", side_effect=[taunt] + [neutral] * 8):
+                with patch(
+                    "hk_rl_DQN.real_dqn.select_action",
+                    side_effect=[taunt] + [neutral] * 11,
+                ):
                     trainer.observe(first)
                     if name == "miss":
-                        for frame in range(2, 8):
+                        for frame in range(2, 12):
                             trainer.observe(snapshot("Movement 1", frame))
                     else:
                         second = snapshot(
@@ -882,15 +995,20 @@ class BranchingDQNTests(unittest.TestCase):
                 affected = next(
                     item for item in trainer.replay._items if item.action_vector[2] == 4
                 )
+                self.assertEqual(
+                    sum(item.action_vector[2] == 4 for item in trainer.replay._items),
+                    1,
+                )
                 expected_reward = STEP_PENALTY + expected
                 if "health" in outcome:
-                    expected_reward -= 3.0
+                    expected_reward -= 3.6 * (10 - int(outcome["health"]))
                 self.assertAlmostEqual(
                     affected.reward,
                     expected_reward,
                 )
-                self.assertEqual(trainer.metrics.unattributed_damage_reward, 0.5 if "boss_damage_total" in outcome else 0.0)
+                self.assertEqual(trainer.metrics.unattributed_damage_reward, 1.0 if "boss_damage_total" in outcome else 0.0)
                 if "health" in outcome:
+                    self.assertEqual(trainer.metrics.taunt_hurts, 1)
                     self.assertEqual(trainer.metrics.combat_hurt_penalty, 0.0)
             finally:
                 executor.close()
@@ -933,8 +1051,8 @@ class BranchingDQNTests(unittest.TestCase):
                 for frame in range(4, 23):
                     trainer.observe(snapshot("Movement 1", frame))
             credited = trainer.replay._items[0]
-            self.assertAlmostEqual(credited.reward, STEP_PENALTY + 0.5)
-            self.assertAlmostEqual(trainer.metrics.damage_credit_reward, 0.5)
+            self.assertAlmostEqual(credited.reward, STEP_PENALTY + 1.0)
+            self.assertAlmostEqual(trainer.metrics.damage_credit_reward, 1.0)
             self.assertEqual(trainer.metrics.offensive_misses, 0)
         finally:
             executor.close()
@@ -979,9 +1097,9 @@ class BranchingDQNTests(unittest.TestCase):
             credited = next(
                 item for item in trainer.replay._items if item.action_vector[1] == 6
             )
-            self.assertAlmostEqual(credited.reward, STEP_PENALTY + 0.5)
+            self.assertAlmostEqual(credited.reward, STEP_PENALTY + 1.0)
             self.assertEqual(trainer.metrics.offensive_misses, 0)
-            self.assertAlmostEqual(trainer.metrics.harpoon_damage_reward, 0.5)
+            self.assertAlmostEqual(trainer.metrics.harpoon_damage_reward, 1.0)
         finally:
             executor.close()
             path.unlink(missing_ok=True)
@@ -1059,15 +1177,15 @@ class BranchingDQNTests(unittest.TestCase):
             credited = next(
                 item for item in trainer.replay._items if item.action_vector[2] == 5
             )
-            self.assertGreaterEqual(credited.reward, STEP_PENALTY + 2.0)
+            self.assertGreaterEqual(credited.reward, STEP_PENALTY + 0.8)
             self.assertEqual(trainer.metrics.player_parries, 1)
-            self.assertEqual(trainer.metrics.parry_credit_reward, 2.0)
+            self.assertEqual(trainer.metrics.parry_credit_reward, 0.8)
             self.assertEqual(trainer.metrics.offensive_misses, 0)
         finally:
             executor.close()
             path.unlink(missing_ok=True)
 
-    def test_empty_attack_and_spell_each_penalize_combat_by_half(self) -> None:
+    def test_empty_attack_and_spell_use_typed_miss_penalties(self) -> None:
         cases = (
             ("attack", "normal", 1, 154.0, 20.0, True),
             ("attack", "up", 5, 152.0, 24.0, True),
@@ -1113,7 +1231,12 @@ class BranchingDQNTests(unittest.TestCase):
                     if item.action_vector[2] == combat_value
                 )
                 self.assertEqual(trainer.metrics.offensive_misses, 1)
-                self.assertAlmostEqual(missed.reward, STEP_PENALTY - 0.5)
+                expected_penalty = (
+                    ATTACK_MISS_PENALTY
+                    if action_kind == "attack"
+                    else SPELL_MISS_PENALTY
+                )
+                self.assertAlmostEqual(missed.reward, STEP_PENALTY + expected_penalty)
                 self.assertEqual(
                     getattr(trainer.metrics, f"{action_kind}_misses"), 1
                 )
@@ -1192,10 +1315,7 @@ class BranchingDQNTests(unittest.TestCase):
             path.unlink(missing_ok=True)
 
     def test_plugin_attack_events_assign_each_fixed_budget_once(self) -> None:
-        for was_hit, expected_budget in (
-            (False, EVADE_SUCCESS_REWARD),
-            (True, EVADE_FAILURE_PENALTY),
-        ):
+        for was_hit in (False, True):
             path = Path(f"tests/.real_dqn_attack_event_{was_hit}.jsonl")
             executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
             online = BranchingDQN()
@@ -1247,19 +1367,303 @@ class BranchingDQNTests(unittest.TestCase):
                         last_finished_id=41,
                         last_hit_id=41 if was_hit else 0,
                     ))
+                    for frame in range(6, 12):
+                        trainer.observe(with_attack_event(
+                            snapshot("Movement 1", frame, health=9 if was_hit else 10),
+                            attack_id=0,
+                            phase="idle",
+                            finished=1,
+                            hits=int(was_hit),
+                            last_finished_id=41,
+                            last_hit_id=41 if was_hit else 0,
+                        ))
                 self.assertEqual(
                     trainer.metrics.dodges + trainer.metrics.failed_dodges,
-                    dodge_count,
+                    dodge_count + 1,
+                )
+                resolved_count = trainer.metrics.dodges + trainer.metrics.failed_dodges
+                with patch("hk_rl_DQN.real_dqn.select_action", return_value=neutral):
+                    trainer.observe(with_attack_event(
+                        snapshot("Movement 1", 12, health=9 if was_hit else 10),
+                        attack_id=0,
+                        phase="idle",
+                        finished=1,
+                        hits=int(was_hit),
+                        last_finished_id=41,
+                        last_hit_id=41 if was_hit else 0,
+                    ))
+                self.assertEqual(
+                    trainer.metrics.dodges + trainer.metrics.failed_dodges,
+                    resolved_count,
                 )
                 applied = (
                     trainer.metrics.evade_failure_backfill_penalty
                     if was_hit
                     else trainer.metrics.dodge_backfill_reward
                 )
-                self.assertAlmostEqual(applied, expected_budget)
+                if was_hit:
+                    self.assertAlmostEqual(applied, EVADE_FAILURE_PENALTY)
+                else:
+                    self.assertAlmostEqual(applied, EVADE_SUCCESS_REWARD)
             finally:
                 executor.close()
                 path.unlink(missing_ok=True)
+
+    def test_late_hit_inside_grace_window_flips_combo_to_failure(self) -> None:
+        path = Path("tests/.real_dqn_late_attack_hit.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 1, 0)):
+                trainer.observe(with_attack_event(
+                    snapshot("Movement 1", 1), attack_id=51, phase="startup", active=0
+                ))
+                trainer.observe(with_attack_event(
+                    snapshot("Movement 1", 2), attack_id=51, phase="active"
+                ))
+                trainer.observe(with_attack_event(
+                    snapshot("Movement 1", 3),
+                    attack_id=0,
+                    phase="idle",
+                    finished=1,
+                    last_finished_id=51,
+                ))
+                trainer.observe(with_attack_event(
+                    snapshot("Movement 1", 4),
+                    attack_id=0,
+                    phase="idle",
+                    finished=1,
+                    last_finished_id=51,
+                ))
+                trainer.observe(with_attack_event(
+                    snapshot("Movement 1", 5, health=9),
+                    attack_id=0,
+                    phase="idle",
+                    finished=1,
+                    hits=1,
+                    last_finished_id=51,
+                    last_hit_id=51,
+                ))
+                for frame in range(6, 12):
+                    trainer.observe(with_attack_event(
+                        snapshot("Movement 1", frame, health=9),
+                        attack_id=0,
+                        phase="idle",
+                        finished=1,
+                        hits=1,
+                        last_finished_id=51,
+                        last_hit_id=51,
+                    ))
+            self.assertEqual(trainer.metrics.dodges, 0)
+            self.assertEqual(trainer.metrics.failed_dodges, 1)
+            self.assertEqual(
+                trainer.metrics.evade_failure_backfill_penalty,
+                EVADE_FAILURE_PENALTY,
+            )
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_damage_penalty_covers_last_two_macro_action_segments(self) -> None:
+        path = Path("tests/.real_dqn_macro_hurt.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        actions = [
+            (0, 2, 0),
+            (0, 2, 0),
+            (0, 0, 1),
+            (0, 0, 1),
+            (0, 1, 0),
+            (0, 1, 0),
+            (0, 0, 4),
+            (0, 0, 0),
+            (0, 0, 0),
+            (0, 0, 0),
+        ]
+        try:
+            with (
+                patch(
+                    "hk_rl_DQN.real_dqn.branch_availability",
+                    return_value=(ALL_ACTIONS_AVAILABLE, ()),
+                ),
+                patch("hk_rl_DQN.real_dqn.select_action", side_effect=actions),
+            ):
+                for frame in range(1, 11):
+                    trainer.observe(
+                        snapshot("Movement 1", frame, health=9 if frame == 10 else 10)
+                    )
+            penalized_ids = {
+                item.macro_id
+                for item in trainer.pending_credit_transitions
+                if item.delayed_reward < 0
+            }
+            recent = [
+                item
+                for item in trainer.pending_credit_transitions
+                if item.macro_id in penalized_ids
+            ]
+            older = [
+                item
+                for item in trainer.pending_credit_transitions
+                if item.macro_id not in penalized_ids
+            ]
+            self.assertEqual(trainer.metrics.macro_hurt_penalty, -3.6)
+            self.assertTrue(recent)
+            self.assertTrue(all(item.delayed_reward < 0 for item in recent))
+            self.assertTrue(all(item.delayed_reward == 0 for item in older))
+            self.assertEqual(penalized_ids, {3, 4})
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_dense_shaping_penalizes_stagnation_and_long_no_damage(self) -> None:
+        path = Path("tests/.real_dqn_dense_shaping.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 1, 0)):
+                for frame in range(1, 52):
+                    item = snapshot("Movement 1", frame)
+                    item["boss"]["x"] = 160.0
+                    trainer.observe(item)
+            self.assertEqual(trainer.metrics.long_no_damage_events, 1)
+            self.assertEqual(trainer.metrics.long_no_damage_penalty, LONG_NO_DAMAGE_PENALTY)
+            self.assertGreater(trainer.metrics.stagnation_events, 0)
+            self.assertAlmostEqual(
+                trainer.metrics.stagnation_penalty,
+                trainer.metrics.stagnation_events * STAGNATION_PENALTY,
+            )
+            self.assertAlmostEqual(
+                trainer.metrics.boss_proximity_reward,
+                BOSS_PROXIMITY_REWARD,
+            )
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_boss_proximity_reward_refreshes_after_damage_and_reentry(self) -> None:
+        path = Path("tests/.real_dqn_proximity_refresh.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 0, 0)):
+                for frame, boss_x, damage in (
+                    (1, 170.0, 0),
+                    (2, 160.0, 0),
+                    (3, 160.0, 0),
+                    (4, 160.0, 10),
+                    (5, 170.0, 10),
+                    (6, 160.0, 10),
+                ):
+                    item = snapshot("Movement 1", frame)
+                    item["boss"]["x"] = boss_x
+                    item["boss_damage_total"] = damage
+                    trainer.observe(item)
+            self.assertAlmostEqual(
+                trainer.metrics.boss_proximity_reward,
+                2 * BOSS_PROXIMITY_REWARD,
+            )
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_arena_outer_ten_percent_is_penalized_every_tick(self) -> None:
+        path = Path("tests/.real_dqn_boundary.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 0, 0)):
+                for frame in range(1, 5):
+                    item = snapshot("Movement 1", frame)
+                    item["player"]["x"] = 165.0
+                    trainer.observe(item)
+            self.assertEqual(trainer.metrics.boundary_events, 3)
+            self.assertAlmostEqual(
+                trainer.metrics.boundary_penalty,
+                3 * ARENA_BOUNDARY_PENALTY,
+            )
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
+
+    def test_finished_episode_reward_equals_finalized_replay_sum(self) -> None:
+        path = Path("tests/.real_dqn_final_reward.jsonl")
+        executor = KeyboardActionExecutor(ActionRecorder(path), send_input=False)
+        online = BranchingDQN()
+        trainer = LiveTrainer(
+            online,
+            BranchingDQN(),
+            torch.optim.AdamW(online.parameters(), lr=1e-4),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        try:
+            with (
+                patch(
+                    "hk_rl_DQN.real_dqn.branch_availability",
+                    return_value=(ALL_ACTIONS_AVAILABLE, ()),
+                ),
+                patch("hk_rl_DQN.real_dqn.select_action", return_value=(0, 0, 1)),
+            ):
+                first = snapshot("Slash Antic", 1)
+                first["boss_damage_total"] = 0
+                first["player_parry_events"] = 0
+                second = snapshot("Slash 1", 2)
+                second["boss_damage_total"] = 10
+                second["player_parry_events"] = 1
+                trainer.observe(first)
+                trainer.observe(second)
+            result = trainer.finish_episode()
+            self.assertEqual(result["damage_credit_reward"], 1.0)
+            self.assertEqual(result["parry_credit_reward"], 0.8)
+            self.assertAlmostEqual(
+                result["reward"],
+                sum(item.reward for item in trainer.replay._items),
+            )
+        finally:
+            executor.close()
+            path.unlink(missing_ok=True)
 
     def test_player_hurt_is_credited_to_recent_combat_action(self) -> None:
         path = Path("tests/.real_dqn_temporal_hurt.jsonl")
@@ -1292,10 +1696,14 @@ class BranchingDQNTests(unittest.TestCase):
             attack = next(
                 item for item in trainer.replay._items if item.action_vector == (0, 0, 1)
             )
-            self.assertAlmostEqual(
-                attack.reward,
-                STEP_PENALTY + COMBAT_HURT_EVENT_PENALTY,
-            )
+            self.assertLess(attack.reward, STEP_PENALTY + COMBAT_HURT_EVENT_PENALTY)
+            self.assertEqual(trainer.metrics.macro_hurt_penalty, -3.6)
+            neutral_rewards = [
+                item.reward
+                for item in trainer.replay._items
+                if item.action_vector == (0, 0, 0)
+            ]
+            self.assertTrue(any(value < STEP_PENALTY for value in neutral_rewards))
             self.assertEqual(
                 trainer.metrics.combat_hurt_penalty,
                 COMBAT_HURT_EVENT_PENALTY,

@@ -65,10 +65,14 @@ Sampling defaults to 100 ms. The settings are generated in the plugin config:
   "player_control": {
     "jump_available": true,
     "dash_available": true,
-    "attack_available": true
+    "attack_available": true,
+    "taunt_available": true
   }
 }
 ```
+
+`taunt_available` mirrors the real `Silk Specials` FSM gate:
+`HeroController.CanCast()`, not hard-landing, and `onGround`.
 
 `skill_available` is the result of `HeroController.CanHarpoonDash()`.
 `spell_available` combines current silk, `PlayerData.SilkSkillCost`, the

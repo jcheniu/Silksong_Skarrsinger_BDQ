@@ -18,7 +18,7 @@ BRANCH_NAMES = (
     "combat",
 )
 BRANCH_SIZES = (3, 7, 7)
-ACTION_PROTOCOL = "semantic-joint-v16-opportunity-commitment"
+ACTION_PROTOCOL = "semantic-joint-v18-macro-credit"
 BranchMasks = tuple[tuple[bool, ...], ...]
 
 KEYS = {
@@ -39,6 +39,7 @@ KEYEVENTF_EXTENDEDKEY = 0x0001
 KEYEVENTF_KEYUP = 0x0002
 KEYEVENTF_SCANCODE = 0x0008
 SW_RESTORE = 9
+SPI_GETWORKAREA = 0x0030
 
 
 class KEYBDINPUT(ctypes.Structure):
@@ -102,6 +103,7 @@ def branch_availability(
     snapshot: Mapping[str, object],
     continuing_action: Sequence[int] | None = None,
     harpoon_locked: bool = False,
+    taunt_locked: bool = False,
     charge_protected: bool = False,
     charge_must_hold: bool = False,
 ) -> tuple[BranchMasks, tuple[str, ...]]:
@@ -115,9 +117,10 @@ def branch_availability(
     )
     reasons: list[str] = []
     resources = decode_player_resources(snapshot)
-    if harpoon_locked:
+    if harpoon_locked or taunt_locked:
         masks = [[index == 0 for index in range(size)] for size in BRANCH_SIZES]
-        reasons.append("all branches masked: harpoon active/recovery lock")
+        lock_name = "harpoon active/recovery" if harpoon_locked else "taunt recovery"
+        reasons.append(f"all branches masked: {lock_name} lock")
         return validate_masks(masks), tuple(reasons)
     if not resources.can_harpoon_dash:
         masks[1][6] = False
@@ -155,6 +158,12 @@ def branch_availability(
     masks[2][2] = attack_available or continuing[2] == 2
     if not attack_available:
         reasons.append("attack start masked: attack_available is false or unavailable")
+    taunt_available = control_values.get("taunt_available") is True
+    masks[2][4] = taunt_available
+    if not taunt_available:
+        reasons.append(
+            "taunt masked: CanCast/on-ground/hard-landing check is false or unavailable"
+        )
     if charge_must_hold:
         masks[2] = [index == 2 for index in range(BRANCH_SIZES[2])]
         reasons.append("combat branch locked: incomplete charge must keep holding X")
@@ -277,6 +286,33 @@ def focus_game_window(timeout_s: float = 60.0) -> int:
     return hwnd
 
 
+def place_game_window_top_left_quarter(timeout_s: float = 60.0) -> int:
+    """Place the restored game window in the top-left quarter of the work area."""
+
+    hwnd = focus_game_window(timeout_s)
+    user32 = ctypes.windll.user32
+    work_area = wintypes.RECT()
+    if not user32.SystemParametersInfoW(
+        SPI_GETWORKAREA,
+        0,
+        ctypes.byref(work_area),
+        0,
+    ):
+        raise ctypes.WinError()
+    width = max(1, (work_area.right - work_area.left) // 2)
+    height = max(1, (work_area.bottom - work_area.top) // 2)
+    if not user32.MoveWindow(
+        hwnd,
+        work_area.left,
+        work_area.top,
+        width,
+        height,
+        True,
+    ):
+        raise ctypes.WinError()
+    return hwnd
+
+
 @dataclass
 class KeyboardActionExecutor:
     """Maintain desired key state across fixed-duration control ticks."""
@@ -286,6 +322,8 @@ class KeyboardActionExecutor:
     send_input: bool = False
     harpoon_active_ms: int = 300
     harpoon_lock_ms: int = 900
+    # V has a fixed one-second stationary recovery window.
+    taunt_lock_ms: int = 1000
     charge_release_protection_ms: int = 500
 
     def __post_init__(self) -> None:
@@ -293,9 +331,12 @@ class KeyboardActionExecutor:
             raise ValueError("tick_ms must be positive")
         if not 0 < self.harpoon_active_ms <= self.harpoon_lock_ms:
             raise ValueError("harpoon timing must satisfy 0 < active <= lock")
+        if self.taunt_lock_ms <= 0:
+            raise ValueError("taunt_lock_ms must be positive")
         self._held_keys: set[str] = set()
         self._charge = ChargeState()
         self._harpoon_lock_remaining_ms = 0
+        self._taunt_lock_remaining_ms = 0
         self._charge_release_protection_remaining_ms = 0
         self._last_executed = (0,) * len(BRANCH_SIZES)
         self._interrupted = False
@@ -305,6 +346,8 @@ class KeyboardActionExecutor:
     def control_state(self, snapshot: Mapping[str, object]) -> KeyHoldState:
         del snapshot
         jump_value, movement_value, combat_value = self._last_executed
+        if self.taunt_locked:
+            combat_value = 4
         movement_direction = (
             -1.0 if movement_value in (1, 4) else 1.0 if movement_value in (2, 5) else 0.0
         )
@@ -348,6 +391,14 @@ class KeyboardActionExecutor:
         return self._harpoon_lock_remaining_ms > 0
 
     @property
+    def taunt_locked(self) -> bool:
+        return self._taunt_lock_remaining_ms > 0
+
+    @property
+    def taunt_outcome_steps(self) -> int:
+        return max(1, (self.taunt_lock_ms + self.tick_ms - 1) // self.tick_ms)
+
+    @property
     def charge_protected(self) -> bool:
         return (
             self._charge.active
@@ -388,11 +439,16 @@ class KeyboardActionExecutor:
         else:
             values = attempted
         adjusted_reasons: list[str] = []
-        lock_was_active = self.harpoon_locked
+        harpoon_lock_was_active = self.harpoon_locked
+        taunt_lock_was_active = self.taunt_locked
         harpoon_started = False
-        if lock_was_active:
+        taunt_started = False
+        if harpoon_lock_was_active or taunt_lock_was_active:
             if any(values):
-                adjusted_reasons.append("harpoon lock forced all branches neutral")
+                lock_name = "harpoon" if harpoon_lock_was_active else "taunt"
+                adjusted_reasons.append(
+                    f"{lock_name} lock forced all branches neutral"
+                )
             values = (0,) * len(BRANCH_SIZES)
         else:
             adjusted = list(values)
@@ -421,12 +477,21 @@ class KeyboardActionExecutor:
                     )
                 adjusted[0] = 0
                 adjusted[2] = 0
+            if adjusted[2] == 4:
+                taunt_started = True
+                if adjusted[0] != 0 or adjusted[1] != 0:
+                    adjusted_reasons.append(
+                        "taunt launch forced jump and movement branches neutral"
+                    )
+                adjusted[0] = 0
+                adjusted[1] = 0
             values = tuple(adjusted)
         if interrupted:
             if any(values):
                 adjusted_reasons.append("interruption forced all branches neutral")
             values = (0,) * len(BRANCH_SIZES)
             harpoon_started = False
+            taunt_started = False
         desired = set(action_keys(values))
         pulse_keys: set[str] = set()
 
@@ -460,13 +525,23 @@ class KeyboardActionExecutor:
         self._interrupted = interrupted
         if interrupted:
             self._harpoon_lock_remaining_ms = 0
+            self._taunt_lock_remaining_ms = 0
             self._charge_release_protection_remaining_ms = 0
         elif harpoon_started:
             self._harpoon_lock_remaining_ms = max(0, self.harpoon_lock_ms - self.tick_ms)
-        elif lock_was_active:
+        elif harpoon_lock_was_active:
             self._harpoon_lock_remaining_ms = max(
                 0, self._harpoon_lock_remaining_ms - self.tick_ms
             )
+        if not interrupted:
+            if taunt_started:
+                self._taunt_lock_remaining_ms = max(
+                    0, self.taunt_lock_ms - self.tick_ms
+                )
+            elif taunt_lock_was_active:
+                self._taunt_lock_remaining_ms = max(
+                    0, self._taunt_lock_remaining_ms - self.tick_ms
+                )
         executed = tuple(values)
         recorded_actions = list(decode_actions(executed))
         newly_pressed_keys = tuple(sorted((desired - held_before) | pulse_keys))
@@ -489,7 +564,7 @@ class KeyboardActionExecutor:
             started_branches.append("skill_s")
         if "LeftShift" in newly_pressed_keys:
             started_branches.append("spell_shift")
-        if "V" in newly_pressed_keys:
+        if taunt_started:
             started_branches.append("taunt_v")
         item = self.recorder.record_frame(
             recorded_actions,
@@ -514,6 +589,13 @@ class KeyboardActionExecutor:
                 player_resources.as_dict() if player_resources is not None else None
             ),
         )
+        item["temporal_owner"] = (
+            "taunt_v"
+            if taunt_started or taunt_lock_was_active
+            else "skill_s"
+            if harpoon_started or harpoon_lock_was_active
+            else None
+        )
         self._last_executed = executed
         return item
 
@@ -523,6 +605,7 @@ class KeyboardActionExecutor:
                 _send_key(key, True)
         self._held_keys.clear()
         self._harpoon_lock_remaining_ms = 0
+        self._taunt_lock_remaining_ms = 0
         self._charge_release_protection_remaining_ms = 0
         self._last_executed = (0,) * len(BRANCH_SIZES)
         self._interrupted = True

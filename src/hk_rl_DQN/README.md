@@ -23,12 +23,16 @@ The fixed action vector is `[3,7,7]` in this order: `jump_z, movement, combat`.
 `jump_z` is purely key based: release Z, press Z, or hold Z. Ground jump,
 double jump, and cloak hover are not separate actions. `movement` chooses
 neutral, held left/right, dash, a directed left/right dash, or S harpoon dash.
-`combat` chooses neutral, tap X, hold X, press Shift, hold V, up+X, or down+X.
+`combat` chooses neutral, tap X, hold X, press Shift, press V, up+X, or down+X.
 The three fields are combined into one of `3 * 7 * 7 = 147` joint actions and
 receive one Q-value. Values within one field remain mutually exclusive.
 Harpoon dash is the deliberate exception: S is pulsed for
-one tick, jump/combat are neutralized on launch, and all heads remain neutral
+one tick, jump/combat are neutralized on launch, and all fields remain neutral
 during its active/recovery lock. There is no dedicated wall-jump or sustained-run action.
+V is also atomic. The game FSM requires `CanCast`, no hard landing, and an
+on-ground player. V uses a fixed 1,000 ms stationary recovery lock and launches
+as `[0,0,4]`; jump and movement are neutral during launch and every recovery
+tick.
 Healing key `A` is deliberately absent from the action space and all input
 adapters.
 The full protocol and rationale are in
@@ -60,7 +64,11 @@ Dry-run actions are logged, but they are not added to replay and do not update
 the network because the corresponding keys were not executed in the game.
 
 Add `--execute-actions` only when the game is ready for autonomous keyboard
-control. Add `--launch` to let the trainer start the configured game executable.
+control. During active training the restored game window is placed in the
+top-left quarter of the primary desktop work area by default. Add
+`--full-window` to preserve its existing size and position. Add `--launch` to
+let the trainer start the configured game executable. Relaunched game windows
+are positioned again automatically.
 
 Checkpoint behavior is conservative: without `--reset`, an existing checkpoint
 is resumed and a missing checkpoint starts a new run. An incompatible or broken
@@ -78,29 +86,39 @@ ability-disable state, harpoon availability, and quick-cast availability.
 `CanHarpoonDash()` result and does not require silk;
 `spell_shift` is masked when silk is insufficient or the action is unavailable.
 
-The current reward protocol is `opportunity-gated-credit-v17`.
-The first 2,000 executed transitions use pure weighted exploration. Replay
-training starts at 1,000 transitions, so the network receives roughly 1,000
-gradient updates before greedy actions can influence play. After transition
-2,000, epsilon starts at `0.60` and decays to `0.03` over 15,000 further
-steps. Exploration samples sparse legal branch combinations instead of
-uniformly randomizing every branch.
+The current reward protocol is `normalized-evade-budget-v22-evaluation`.
+Replay training starts at 1,000 transitions. The previous v19 schedule decayed
+epsilon across 200 completed episodes, not 500. Version 20 instead drives
+epsilon from training transitions: a normalized reciprocal curve falls quickly
+at first and then slowly from `0.60` to `0.02` across 150,000 transitions.
+Exploration samples sparse legal branch combinations instead of uniformly
+randomizing every branch.
 Movement exploration weights left/right at 32% each, dash at 12%, directed
 dashes at 8% each, and S at 8%. Exploratory left/right actions persist for a
 total of 2-3 control ticks. Combat exploration weights tap X, hold X, Shift,
 taunt, up+X, and down+X as `30/8/8/1/20/20`, keeping taunt available without
 letting it dominate cold-start data.
-The plugin emits monotonic Boss `attack_id` events. Each completed active attack
-receives one normalized joint-action budget: `+0.2` when the whole window is
-avoided and `-1.0` when it hits Hornet. Successful credit is restricted to
-combat-neutral jump, direction, and dash actions; neutral, taunt, X/Shift, and S
-cannot collect it. Failed-dodge credit remains a fixed total budget and cannot
-be avoided by standing neutral. Player damage applies one additional `-0.75`
+Player damage is `-3.6` per lost health point. That fixed event budget is
+distributed across every pending transition in the two most recent contiguous
+macro-action segments. Forced-neutral V ticks retain V ownership, so a sequence
+ending in left movement then V penalizes the complete left and V segments.
+Damage during V also applies its separate `-1.0` per-HP taunt-risk penalty to
+the transition that launched V.
+The plugin emits monotonic Boss `attack_id` events. An attack window starts at
+the Boss attack-intent event and remains open for 700 ms after the finish event.
+If the complete window is avoided, every action in the window receives part of
+one fixed `+0.6` budget. Linear weights fall from `1.0` for the first action to
+`0.5` for the final action and are normalized before distribution. Combat,
+movement, jump, and neutral actions can all receive this credit, so attacking
+and dodging rewards can stack. A hit instead applies one normalized `-1.0`
+failure budget across the window. Player damage
+applies one additional `-0.75`
 combat responsibility budget only to started X/Shift actions whose short
 recovery window overlapped an active Boss threat. It is not multiplied by HP.
-X, completed charge releases, and Shift receive `-0.5` only when they started
-inside a confirmed vulnerable range, completed without interruption, and their
-20-tick result window expires without Boss HP loss or a successful parry.
+X and completed charge releases receive `-0.25`, while Shift receives `-0.5`,
+only when they started inside a confirmed vulnerable range, completed without
+interruption, and their 20-tick result window expires without Boss HP loss or a
+successful parry. S never receives an offensive-miss penalty.
 The plugin's read-only `boss_vulnerable` flag comes directly from
 `HealthManager.IsInvincible`; it controls masks and credit eligibility without
 increasing the 24-value observation.
@@ -108,7 +126,7 @@ Out-of-range attacks are hard-masked; predictive fringe attacks remain legal
 but are not treated as misses. S damage trains its joint action, but an S movement
 that deals no damage is not treated as an offensive miss. Telemetry counts
 `HeroController.NailParry()` events. A new event inside a Boss attack/combo window
-gives `+2.0` to the most recent X attack transition. The
+gives `+0.8` to the most recent X attack transition. The
 Boss `blocked` reaction is not used for this reward. Replay stores the executor's
 actual action after smoothing and temporal fragments. Delayed outcomes mutate
 only a pending-credit ledger; after the 20-tick attribution horizon, an
@@ -116,8 +134,15 @@ immutable scalar-reward transition is appended to replay. Unattributed damage
 or parry events are reported but do not reinforce the current unrelated action.
 Greedy jump and left/right movement receive a 200-300 ms minimum commitment.
 An active/closing Boss attack, player damage, or an invalid executed action may
-break the commitment early. Use `--reset` because checkpoint version 23 changes
-reward and action semantics; checkpoint version 22 replay must not be reused.
+break the commitment early. Five seconds without Boss damage adds `-0.05`;
+directional movement confined to 10% of arena width for about one second adds
+`-0.05` per later tick. Entering the large outer Boss-proximity zone gives `+0.005` once,
+then locks until confirmed Boss damage refreshes it and the player leaves and
+re-enters. The outermost 10% at either arena boundary costs `-0.02` every tick.
+Silk consumption costs `-0.04` per unit.
+Use `--reset` because checkpoint version 28 normalizes successful evade credit;
+version 27 replay must not be
+reused.
 
 X charge is valid for a release window rather than one fixed duration. It
 becomes complete at 1,350 ms. With a 100 ms control tick, the first practical
@@ -133,6 +158,10 @@ Every completed episode reports `replay_size`, `global_step`,
 each action field, and one `mean_policy_q` for the selected joint action. A null loss with replay below
 1,000 is expected because warmup has not completed. Loss is a moving TD target
 and is not expected to decrease monotonically between episodes.
+After every 10 training episodes, the next encounter is an independent greedy
+evaluation with epsilon zero. Evaluation rows have `"evaluation": true`; they
+do not append replay, update gradients, advance `global_step`, or increment the
+training episode count.
 
 Telemetry continues during encounter transitions and includes a monotonic
 `encounter_id` for each plugin process. The trainer uses inactive snapshots or
