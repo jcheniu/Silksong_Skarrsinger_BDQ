@@ -183,14 +183,10 @@ internal sealed class TelemetryRecorder : IDisposable
         }
         bool jumpAvailable = hero.CanJump();
         bool doubleJumpAvailable = hero.CanDoubleJump(false);
-        bool tauntAvailable = hero.CanCast()
-            && !hero.IsHardLanding()
-            && hero.GetState("onGround");
         json.Append($"{{\"jump_available\":{Bool(jumpAvailable)}");
         json.Append($",\"double_jump_available\":{Bool(doubleJumpAvailable)}");
         json.Append($",\"dash_available\":{Bool(hero.CanDash())}");
-        json.Append($",\"attack_available\":{Bool(hero.CanAttack())}");
-        json.Append($",\"taunt_available\":{Bool(tauntAvailable)}}}");
+        json.Append($",\"attack_available\":{Bool(hero.CanAttack())}}}");
     }
 
     private static void AppendTransform(StringBuilder json, Transform? transform, Rigidbody2D? body)

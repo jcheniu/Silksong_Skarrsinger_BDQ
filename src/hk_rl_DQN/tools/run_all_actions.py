@@ -20,17 +20,15 @@ BDQ_ACTION_CASES: dict[str, tuple[tuple[int, int, int], int]] = {
     "jump_hold": ((2, 0, 0), 8),
     "move_left": ((0, 1, 0), 1),
     "move_right": ((0, 2, 0), 1),
-    "dash": ((0, 3, 0), 1),
-    "left_dash": ((0, 4, 0), 1),
-    "right_dash": ((0, 5, 0), 1),
+    "left_dash": ((0, 3, 0), 1),
+    "right_dash": ((0, 4, 0), 1),
     "attack": ((0, 0, 1), 1),
-    "up_attack": ((0, 0, 5), 1),
-    "down_attack": ((0, 0, 6), 1),
+    "up_attack": ((0, 0, 4), 1),
+    "down_attack": ((0, 0, 5), 1),
     "attack_charge": ((0, 0, 2), 14),
-    "harpoon_dash": ((0, 6, 0), 1),
+    "harpoon_dash": ((0, 5, 0), 1),
     "quick_cast": ((0, 0, 3), 1),
-    "taunt_hold": ((0, 0, 4), 2),
-    "combined_jump_right_dash_attack": ((2, 5, 1), 1),
+    "combined_jump_right_dash_attack": ((2, 4, 1), 1),
 }
 
 

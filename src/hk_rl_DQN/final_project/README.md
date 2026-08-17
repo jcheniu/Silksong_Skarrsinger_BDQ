@@ -6,7 +6,8 @@ agent. It does not replace the verified `boss_env.py` simulator.
 ## Combat Actions
 
 The executor consumes a three-value `jump_z`, `movement`, and `combat` vector
-for each control tick. The DQN evaluates all 147 combinations jointly, then
+for each control tick. The DQN evaluates a curated catalog of 53 combinations
+jointly, then
 decodes the selected ID back to this vector. This preserves combinations such
 as `right + attack` and `left + jump` while learning their coordination value.
 The recorder is intentionally separate from that adapter and only persists
@@ -17,20 +18,20 @@ The implemented Multi-Discrete executor and joint-action DQN are recorded in
 single-action baseline is preserved under `history/simulator_dqn_v1`.
 
 Boss attacks use plugin-emitted `attack_id` lifecycle events. Each completed
-active attack remains open for 400 ms to accept a delayed
-`last_player_hit_id`, then distributes one fixed `+0.5` eligible-movement
+active attack remains open for 600 ms to accept a delayed
+`last_player_hit_id`, then distributes one fixed `+0.75` successful-evade
 success or `-1.0` failure budget across its pending joint actions. Replay
 insertion waits for delayed credit to finish.
 
 X attacks use three geometric zones. Clearly unreachable actions are masked,
 predictive fringe actions remain legal without miss punishment, and only
 confirmed vulnerable-range actions can receive a completed-animation miss.
-Normal, directional, and completed charged X misses cost `-0.25`; quick-cast
-Shift misses cost `-0.5`.
+Normal, directional, and completed charged X misses cost `-0.2`; quick-cast
+Shift misses cost `-0.8`.
 Relative velocity predicts the Boss position 150 ms into the attack startup.
 Successful player nail clashes are read from the telemetry
 `player_parry_events` counter, not from the Boss `blocked` FSM reaction. A
-clash inside the Boss attack window gives `+0.8` to the recent X attack action
+clash inside the Boss attack window gives `+0.5` to the recent X attack action
 in the combat head and counts as a productive attack outcome.
 
 The action catalog is in `action_catalog.py`. It uses the local bindings:
@@ -40,7 +41,7 @@ The action catalog is in `action_catalog.py`. It uses the local bindings:
   events produce a ground jump, double jump, or cloak hover from game state;
   there is no `wall_jump` action
 - `LeftArrow` / `RightArrow` / `C` / `S`: one movement head with held
-  direction, neutral/directed dash values, and harpoon dash
+  direction, directed dash values, and harpoon dash
 - `X`: tap for normal attack, or keep the `attack_charge` intent present over
   successive frames. Completion requires at least 1.35 s; with 100 ms control
   ticks, the first practical release is at 1.4 s. It is forced to release at
@@ -59,12 +60,7 @@ The action catalog is in `action_catalog.py`. It uses the local bindings:
   credited to the movement transition, but an S movement that deals no damage
   is not treated as an offensive miss. Holding S is bounded to 900 ms.
 - `D`: disabled and never sent by the live policy
-- `V`: battle taunt. The real FSM accepts it only when `CanCast()` is true,
-  Hornet is grounded, and she is not in hard landing. V forces a fixed
-  1,000 ms stationary recovery lock. It launches only as `[0,0,4]`; all later
-  lock ticks are `[0,0,0]`. Damage during the lock adds `-1.0` per lost health point to
-  the one transition that started V. Boss damage is not treated as proof that
-  taunting succeeded.
+- `V`: disabled and absent from the policy, executor, and reward protocol
 
 Healing key `A` is disabled. `Q`, `I`, `Tab`, `J`, and `T` are also
 intentionally excluded.
@@ -113,7 +109,7 @@ The exact live-policy vector can also be tested directly. This example applies
 
 ```powershell
 python -m hk_rl_DQN.tools.cold_start_action_test `
-  --action-vector 2 5 1 --ticks 1 --tick-ms 100 `
+  --action-vector 2 4 1 --ticks 1 --tick-ms 100 `
   --game-exe 'C:\Program Files (x86)\Steam\steamapps\common\Hollow Knight Silksong\Hollow Knight Silksong.exe' `
   --log 'C:\Program Files (x86)\Steam\steamapps\common\Hollow Knight Silksong\BepInEx\LogOutput.log'
 ```

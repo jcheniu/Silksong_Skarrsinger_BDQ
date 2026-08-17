@@ -28,7 +28,8 @@ ACTION_CATALOG: tuple[ActionSpec, ...] = (
     ActionSpec(
         "jump_hold", "Z", 100, False, "Keep Z held for this control interval"
     ),
-    ActionSpec("dash", "C", 50, False, "Tap C for a dash"),
+    ActionSpec("left_dash", ("LeftArrow", "C"), 50, False, "Dash left"),
+    ActionSpec("right_dash", ("RightArrow", "C"), 50, False, "Dash right"),
     ActionSpec("attack", "X", 50, False, "Tap X for a normal attack"),
     ActionSpec("up_attack", ("UpArrow", "X"), 50, False, "Hold up and tap X"),
     ActionSpec(
@@ -43,7 +44,6 @@ ACTION_CATALOG: tuple[ActionSpec, ...] = (
     ),
     ActionSpec("quick_cast", "LeftShift", 50, True, "Cast the equipped spell; consumes silk"),
     ActionSpec("harpoon_dash", "S", 50, False, "Harpoon dash / KeySupDash"),
-    ActionSpec("taunt", "V", 50, False, "Battle taunt"),
 )
 
 ACTION_NAMES = tuple(spec.name for spec in ACTION_CATALOG)
@@ -56,14 +56,14 @@ ACTION_VECTORS: dict[str, tuple[int, int, int]] = {
     "wait": (0, 0, 0),
     "jump": (1, 0, 0),
     "jump_hold": (2, 0, 0),
-    "dash": (0, 3, 0),
+    "left_dash": (0, 3, 0),
+    "right_dash": (0, 4, 0),
     "attack": (0, 0, 1),
-    "up_attack": (0, 0, 5),
-    "down_attack": (0, 0, 6),
+    "up_attack": (0, 0, 4),
+    "down_attack": (0, 0, 5),
     "attack_charge": (0, 0, 2),
     "quick_cast": (0, 0, 3),
-    "harpoon_dash": (0, 6, 0),
-    "taunt": (0, 0, 4),
+    "harpoon_dash": (0, 5, 0),
 }
 
 

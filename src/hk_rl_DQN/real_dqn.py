@@ -41,11 +41,11 @@ from .real_state import (
 )
 
 
-STATE_ENCODING = "real-telemetry-state-v13-taunt-lock-24"
+STATE_ENCODING = "real-telemetry-state-v14-curated-action-control-24"
 ALGORITHM = "joint-dueling-double-dqn"
-CHECKPOINT_VERSION = 28
-REPLAY_CHECKPOINT_VERSION = 2
-REWARD_PROTOCOL = "normalized-evade-budget-v22-evaluation"
+CHECKPOINT_VERSION = 30
+REPLAY_CHECKPOINT_VERSION = 3
+REWARD_PROTOCOL = "normalized-evade-budget-v23-curated-53"
 HIDDEN_DIMENSIONS = (96, 96)
 LEARNING_RATE = 1e-4
 GAMMA = 0.99
@@ -54,62 +54,77 @@ REPLAY_CAPACITY = 50_000
 REPLAY_WARMUP = 1_000
 PURE_EXPLORATION_STEPS = 0  # Compatibility only; exploration now decays by episode.
 TARGET_UPDATE_INTERVAL = 500
-EPSILON_START = 0.60
+EPSILON_START = 0.50
 EPSILON_END = 0.02
-EPSILON_DECAY_TRANSITIONS = 150_000
+EPSILON_DECAY_TRANSITIONS = 120_000
 EPSILON_RECIPROCAL_SHAPE = 3.0
 EXPLORATION_ACTIVATION_RATES = (0.45, 0.85, 0.30)
-MOVEMENT_EXPLORATION_WEIGHTS = (0.0, 32.0, 32.0, 12.0, 8.0, 8.0, 8.0)
-COMBAT_EXPLORATION_WEIGHTS = (0.0, 30.0, 8.0, 8.0, 1.0, 20.0, 20.0)
+MOVEMENT_EXPLORATION_WEIGHTS = (0.0, 32.0, 32.0, 8.0, 8.0, 8.0)
+COMBAT_EXPLORATION_WEIGHTS = (0.0, 30.0, 8.0, 8.0, 20.0, 20.0)
 ACTION_LABELS = (
     ("released", "press_z", "hold_z"),
     (
         "neutral",
         "hold_left",
         "hold_right",
-        "dash",
         "left_dash",
         "right_dash",
         "harpoon_s",
     ),
-    ("neutral", "tap_x", "hold_x", "shift", "taunt_v", "up_x", "down_x"),
+    ("neutral", "tap_x", "hold_x", "shift", "up_x", "down_x"),
 )
 COMBAT_HURT_EVENT_PENALTY = -0.75
-EVADE_SUCCESS_REWARD = 0.6
+EVADE_SUCCESS_REWARD = 0.75
 EVADE_FAILURE_PENALTY = -1.0
-ATTACK_END_GRACE_SECONDS = 0.7
+ATTACK_END_GRACE_SECONDS = 0.6
 COMBAT_HURT_CREDIT_WINDOW_STEPS = 6
 CREDIT_FINALIZATION_STEPS = DAMAGE_CREDIT_WINDOW_STEPS = 20
 ATTACK_ANIMATION_COMMITMENT_STEPS = 2
 CHARGE_RELEASE_COMMITMENT_STEPS = 5
 SPELL_ANIMATION_COMMITMENT_STEPS = 3
-TAUNT_STEP_PENALTY = -0.02
-TAUNT_MISS_PENALTY = 0.0
-TAUNT_HURT_PENALTY_PER_HP = -1.0
-ATTACK_MISS_PENALTY = -0.25
-SPELL_MISS_PENALTY = -0.5
+ATTACK_MISS_PENALTY = -0.2
+SPELL_MISS_PENALTY = -0.8
 LONG_NO_DAMAGE_STEPS = 50
-LONG_NO_DAMAGE_PENALTY = -0.05
+LONG_NO_DAMAGE_PENALTY = -0.5
 STAGNATION_WINDOW_STEPS = 10
 STAGNATION_REGION_FRACTION = 0.1
 STAGNATION_PENALTY = -0.05
-BOSS_PROXIMITY_REWARD = 0.005
+BOSS_PROXIMITY_REWARD = 0.05
 BOSS_PROXIMITY_X = 12.0
 BOSS_PROXIMITY_Y = 8.0
-ARENA_BOUNDARY_FRACTION = 0.1
-ARENA_BOUNDARY_PENALTY = -0.02
+ARENA_BOUNDARY_FRACTION = 0.12
+ARENA_BOUNDARY_PENALTY = -0.2
 EVALUATION_INTERVAL_EPISODES = 10
 GRADIENT_CLIP_NORM = 10.0
 BRANCH_INDEX = {name: index for index, name in enumerate(BRANCH_NAMES)}
-JOINT_ACTIONS = tuple(product(*(range(size) for size in BRANCH_SIZES)))
+
+
+def _policy_action_allowed(action: tuple[int, ...]) -> bool:
+    jump, movement, combat = action
+    if movement == 5:
+        return action == (0, 5, 0)
+    if movement in (3, 4) and combat not in (0, 1):
+        return False
+    if jump == 1 and combat not in (0, 2):
+        return False
+    return True
+
+
+JOINT_ACTIONS = tuple(
+    action
+    for action in product(*(range(size) for size in BRANCH_SIZES))
+    if _policy_action_allowed(action)
+)
 JOINT_ACTION_INDEX = {action: index for index, action in enumerate(JOINT_ACTIONS)}
 JOINT_ACTION_COUNT = len(JOINT_ACTIONS)
+if JOINT_ACTION_COUNT != 53:
+    raise AssertionError(f"curated action catalog has {JOINT_ACTION_COUNT} actions, expected 53")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "real_dqn.pt"
 DEFAULT_METRICS = PROJECT_ROOT / "runs" / "real_dqn.jsonl"
 DEFAULT_ACTION_LOG = PROJECT_ROOT / "runs" / "real_dqn_actions.jsonl"
 DEFAULT_CONTROL_TICK_MS = 100
-GAME_RELAUNCH_DELAY_SECONDS = 2.0
+GAME_RELAUNCH_DELAY_SECONDS = 1.0
 GAME_RELAUNCH_WINDOW_SECONDS = 60.0
 MAX_GAME_RELAUNCHES_PER_WINDOW = 3
 DEFAULT_GAME_EXE = Path(
@@ -151,12 +166,16 @@ class JointDQN(nn.Module):
 
 
 # Compatibility name retained for checkpoints/tests; the model has one
-# coordinated 147-action advantage output, not three independent Q heads.
+# coordinated 53-action advantage output, not three independent Q heads.
 BranchingDQN = JointDQN
 
 
 def joint_action_id(action: Sequence[int]) -> int:
-    return JOINT_ACTION_INDEX[validate_action(action)]
+    values = validate_action(action)
+    try:
+        return JOINT_ACTION_INDEX[values]
+    except KeyError:
+        raise ValueError(f"action is not in the curated joint catalog: {values}") from None
 
 
 def decode_joint_action(action_id: int) -> tuple[int, ...]:
@@ -169,8 +188,6 @@ def joint_action_mask(branch_masks: BranchMasks) -> tuple[bool, ...]:
     masks = validate_masks(branch_masks)
     return tuple(
         all(masks[index][value] for index, value in enumerate(action))
-        and not (action[1] == 6 and (action[0] != 0 or action[2] != 0))
-        and not (action[2] == 4 and (action[0] != 0 or action[1] != 0))
         for action in JOINT_ACTIONS
     )
 
@@ -179,10 +196,8 @@ def coordinate_temporal_action(action: Sequence[int]) -> tuple[int, ...]:
     """Canonicalize atomic temporal actions before they reach the executor."""
 
     jump, movement, combat = validate_action(action)
-    if movement == 6:
-        return (0, 6, 0)
-    if combat == 4:
-        return (0, 0, 4)
+    if movement == 5:
+        return (0, 5, 0)
     return jump, movement, combat
 
 
@@ -268,7 +283,7 @@ def apply_attack_opportunity_mask(
     masks = [list(branch) for branch in validate_masks(branch_masks)]
     continuing = validate_action(continuing_action)
     reasons: list[str] = []
-    for combat_action, label in ((1, "horizontal"), (5, "up"), (6, "down")):
+    for combat_action, label in ((1, "horizontal"), (4, "up"), (5, "down")):
         if masks[BRANCH_INDEX["combat"]][combat_action] and not opportunity.allowed(
             combat_action
         ):
@@ -310,12 +325,6 @@ class Transition:
     @property
     def action_vector(self) -> tuple[int, ...]:
         return decode_joint_action(self.action)
-
-
-@dataclass
-class TauntTrial:
-    pending: "PendingTransition"
-    remaining_steps: int
 
 
 @dataclass
@@ -382,18 +391,18 @@ class AttackOpportunity:
     def allowed(self, combat_action: int) -> bool:
         if combat_action in (1, 2):
             return self.horizontal_allowed
-        if combat_action == 5:
+        if combat_action == 4:
             return self.up_allowed
-        if combat_action == 6:
+        if combat_action == 5:
             return self.down_allowed
         return True
 
     def confirmed(self, combat_action: int) -> bool:
         if combat_action in (1, 2):
             return self.horizontal_confirmed
-        if combat_action == 5:
+        if combat_action == 4:
             return self.up_confirmed
-        if combat_action == 6:
+        if combat_action == 5:
             return self.down_confirmed
         return self.boss_vulnerable
 
@@ -643,36 +652,59 @@ def select_action(
     )
     explore = rng.random() < epsilon
     if explore:
-        action = []
-        for branch_index, (size, mask) in enumerate(zip(BRANCH_SIZES, masks)):
-            available = [index for index, allowed in enumerate(mask) if allowed]
-            if not available:
-                raise ValueError("every action branch must have an available value")
-            if branch_index == BRANCH_INDEX["jump_z"] and sticky_jump is not None:
-                action.append(sticky_jump)
-                continue
-            if branch_index == BRANCH_INDEX["movement"] and sticky_movement is not None:
-                action.append(sticky_movement)
-                continue
-            non_neutral = [index for index in available if index != 0]
-            activation_rate = EXPLORATION_ACTIVATION_RATES[branch_index]
-            if non_neutral and rng.random() < activation_rate:
-                if branch_index == BRANCH_INDEX["movement"]:
-                    selected = _weighted_exploration_choice(
-                        non_neutral, MOVEMENT_EXPLORATION_WEIGHTS, rng
-                    )
-                    action.append(selected)
-                elif branch_index == BRANCH_INDEX["combat"]:
-                    action.append(
-                        _weighted_exploration_choice(
-                            non_neutral, COMBAT_EXPLORATION_WEIGHTS, rng
+        legal_actions = [
+            action
+            for action, allowed in zip(JOINT_ACTIONS, joint_mask)
+            if allowed
+            and (sticky_jump is None or action[BRANCH_INDEX["jump_z"]] == sticky_jump)
+            and (
+                sticky_movement is None
+                or action[BRANCH_INDEX["movement"]] == sticky_movement
+            )
+        ]
+        if not legal_actions:
+            raise ValueError("curated action mask must allow at least one joint action")
+        selected_action = legal_actions[0]
+        for _attempt in range(100):
+            sampled: list[int] = []
+            for branch_index, (size, mask) in enumerate(zip(BRANCH_SIZES, masks)):
+                available = [index for index, allowed in enumerate(mask) if allowed]
+                if not available:
+                    raise ValueError("every action branch must have an available value")
+                if branch_index == BRANCH_INDEX["jump_z"] and sticky_jump is not None:
+                    sampled.append(sticky_jump)
+                    continue
+                if (
+                    branch_index == BRANCH_INDEX["movement"]
+                    and sticky_movement is not None
+                ):
+                    sampled.append(sticky_movement)
+                    continue
+                non_neutral = [index for index in available if index != 0]
+                activation_rate = EXPLORATION_ACTIVATION_RATES[branch_index]
+                if non_neutral and rng.random() < activation_rate:
+                    if branch_index == BRANCH_INDEX["movement"]:
+                        sampled.append(
+                            _weighted_exploration_choice(
+                                non_neutral, MOVEMENT_EXPLORATION_WEIGHTS, rng
+                            )
                         )
-                    )
+                    elif branch_index == BRANCH_INDEX["combat"]:
+                        sampled.append(
+                            _weighted_exploration_choice(
+                                non_neutral, COMBAT_EXPLORATION_WEIGHTS, rng
+                            )
+                        )
+                    else:
+                        sampled.append(rng.choice(non_neutral))
                 else:
-                    action.append(rng.choice(non_neutral))
-            else:
-                action.append(0 if 0 in available else rng.choice(available))
-        selected_action = coordinate_temporal_action(action)
+                    sampled.append(0 if 0 in available else rng.choice(available))
+            candidate = coordinate_temporal_action(sampled)
+            if candidate in legal_actions:
+                selected_action = candidate
+                break
+        else:
+            selected_action = rng.choice(legal_actions)
         selected_id = joint_action_id(selected_action)
     else:
         scores = values.squeeze(0).clone()
@@ -761,6 +793,7 @@ def checkpoint_metadata(
         "branch_names": list(BRANCH_NAMES),
         "branch_sizes": list(BRANCH_SIZES),
         "joint_action_count": JOINT_ACTION_COUNT,
+        "joint_actions": [list(action) for action in JOINT_ACTIONS],
         "hidden_dimensions": list(HIDDEN_DIMENSIONS),
         "control_tick_ms": control_tick_ms,
         "replay_checkpoint_version": REPLAY_CHECKPOINT_VERSION,
@@ -784,6 +817,7 @@ def validate_checkpoint(
         "branch_names": list(BRANCH_NAMES),
         "branch_sizes": list(BRANCH_SIZES),
         "joint_action_count": JOINT_ACTION_COUNT,
+        "joint_actions": [list(action) for action in JOINT_ACTIONS],
         "control_tick_ms": control_tick_ms,
         "replay_checkpoint_version": REPLAY_CHECKPOINT_VERSION,
         "replay_capacity": REPLAY_CAPACITY,
@@ -933,9 +967,6 @@ class EpisodeMetrics:
     unattributed_dodges: int = 0
     harpoon_damage_reward: float = 0.0
     offensive_miss_penalty: float = 0.0
-    taunt_misses: int = 0
-    taunt_hurts: int = 0
-    taunt_penalty: float = 0.0
     dodges_by_attack: dict[str, int] = field(default_factory=dict)
     failed_dodges_by_attack: dict[str, int] = field(default_factory=dict)
     illegal_actions: int = 0
@@ -1053,12 +1084,10 @@ class LiveTrainer:
         self.previous_action: tuple[int, ...] | None = None
         self.previous_illegal_penalty = 0.0
         self.previous_illegal_branches: tuple[str, ...] = ()
-        self.previous_taunt_started = False
         self.previous_started_branches: tuple[str, ...] = ()
         self.previous_charge_released = False
         self.previous_attack_opportunity: AttackOpportunity | None = None
         self.pending_credit_transitions: deque[PendingTransition] = deque()
-        self.taunt_trials: list[TauntTrial] = []
         self.action_outcome_trials: list[ActionOutcomeTrial] = []
         self.combat_risk_trials: list[CombatRiskTrial] = []
         self.attack_windows: dict[int, BossAttackCreditWindow] = {}
@@ -1109,10 +1138,8 @@ class LiveTrainer:
         action: tuple[int, ...], temporal_owner: str | None = None
     ) -> tuple[str, int]:
         jump, movement, combat = action
-        if temporal_owner == "taunt_v":
-            return ("combat", 4)
         if temporal_owner == "skill_s":
-            return ("movement", 6)
+            return ("movement", 5)
         if combat != 0:
             return ("combat", combat)
         if movement != 0:
@@ -1201,7 +1228,7 @@ class LiveTrainer:
         movement = pending.transition.action_vector[BRANCH_INDEX["movement"]]
         arena_width = 2.0 * ARENA_HALF_WIDTH
         stagnant = (
-            movement in (1, 2, 4, 5)
+            movement in (1, 2, 3, 4)
             and len(self.current_macro_positions) == self.current_macro_positions.maxlen
             and max(self.current_macro_positions) - min(self.current_macro_positions)
             <= arena_width * STAGNATION_REGION_FRACTION
@@ -1211,28 +1238,6 @@ class LiveTrainer:
             self.metrics.stagnation_events += 1
             self.metrics.stagnation_penalty += STAGNATION_PENALTY
             self.metrics.reward += STAGNATION_PENALTY
-
-    def _apply_taunt_outcomes(self, reward: RewardFrame) -> None:
-        if not self.taunt_trials:
-            return
-        remaining: list[TauntTrial] = []
-        for trial in self.taunt_trials:
-            if reward.player_damage_taken > 0:
-                penalty = (
-                    TAUNT_HURT_PENALTY_PER_HP * reward.player_damage_taken
-                )
-                self.metrics.taunt_hurts += 1
-            else:
-                trial.remaining_steps -= 1
-                if trial.remaining_steps > 0:
-                    remaining.append(trial)
-                    continue
-                penalty = TAUNT_MISS_PENALTY
-                self.metrics.taunt_misses += 1
-            trial.pending.add_reward(penalty)
-            self.metrics.reward += penalty
-            self.metrics.taunt_penalty += penalty
-        self.taunt_trials = remaining
 
     def _register_action_outcome(self, pending: PendingTransition) -> None:
         action_kinds = {
@@ -1631,14 +1636,6 @@ class LiveTrainer:
                 retained.append(pending)
         self.pending_credit_transitions = retained
 
-    def _expire_taunt_trials(self) -> None:
-        for trial in self.taunt_trials:
-            trial.pending.add_reward(TAUNT_MISS_PENALTY)
-            self.metrics.reward += TAUNT_MISS_PENALTY
-            self.metrics.taunt_penalty += TAUNT_MISS_PENALTY
-            self.metrics.taunt_misses += 1
-        self.taunt_trials.clear()
-
     def _expire_action_outcomes(self) -> None:
         for trial in self.action_outcome_trials:
             if (
@@ -1668,7 +1665,6 @@ class LiveTrainer:
             snapshot,
             self.executor.continuing_action,
             harpoon_locked=self.executor.harpoon_locked,
-            taunt_locked=self.executor.taunt_locked,
             charge_protected=self.executor.charge_protected,
             charge_must_hold=self.executor.charge_must_hold,
         )
@@ -1686,9 +1682,6 @@ class LiveTrainer:
             and self.previous_state is not None
             and self.previous_action is not None
         ):
-            taunt_step_penalty = (
-                TAUNT_STEP_PENALTY if self.previous_action[2] == 4 else 0.0
-            )
             transition_reward = (
                 reward.total
                 - reward.damage_reward
@@ -1696,7 +1689,6 @@ class LiveTrainer:
                 - reward.parry_reward
                 - reward.player_hurt
                 + self.previous_illegal_penalty
-                + taunt_step_penalty
             )
             transition = Transition(
                 state=self.previous_state.observation,
@@ -1712,15 +1704,10 @@ class LiveTrainer:
                 macro_id=self.previous_macro_id,
             )
             self.pending_credit_transitions.append(pending)
-            if self.previous_taunt_started:
-                self.taunt_trials.append(
-                    TauntTrial(pending, self.executor.taunt_outcome_steps)
-                )
             self._register_action_outcome(pending)
             self._register_combat_risk(pending)
             self.metrics.steps += 1
             self.metrics.reward += transition_reward
-            self.metrics.taunt_penalty += taunt_step_penalty
             self.metrics.damage_deal += reward.damage_deal
             self.metrics.player_hurts += int(reward.player_hurt < 0)
             self.metrics.player_damage_taken += reward.player_damage_taken
@@ -1735,7 +1722,6 @@ class LiveTrainer:
             if self.previous_illegal_penalty < 0:
                 self.metrics.illegal_actions += 1
                 self.metrics.illegal_action_penalty += self.previous_illegal_penalty
-            self._apply_taunt_outcomes(reward)
             self._apply_action_outcomes(reward, state)
             self._apply_player_hurt_credit(reward)
             self._apply_dense_shaping(reward, state, pending)
@@ -1818,7 +1804,6 @@ class LiveTrainer:
         self.action_exploration_state.reconcile(self.previous_action)
         raw_started = action_result.get("started_branches", ())
         self.previous_started_branches = tuple(str(value) for value in raw_started)
-        self.previous_taunt_started = "taunt_v" in self.previous_started_branches
         self.previous_charge_released = bool(
             action_result.get("charge_released", False)
         )
@@ -1833,7 +1818,6 @@ class LiveTrainer:
 
     def finish_episode(self) -> dict[str, object]:
         was_evaluation = self.evaluation_mode
-        self._expire_taunt_trials()
         self._expire_action_outcomes()
         for attack_id in list(self.attack_windows):
             self._resolve_attack_window(attack_id)
@@ -1853,7 +1837,6 @@ class LiveTrainer:
         self.previous_action = None
         self.previous_illegal_penalty = 0.0
         self.previous_illegal_branches = ()
-        self.previous_taunt_started = False
         self.previous_started_branches = ()
         self.previous_charge_released = False
         self.previous_attack_opportunity = None
@@ -1879,7 +1862,6 @@ class LiveTrainer:
         for attack_id in list(self.attack_windows):
             self._resolve_attack_window(attack_id)
         self._finalize_pending(force=True)
-        self.taunt_trials.clear()
         self.action_outcome_trials.clear()
         self.combat_risk_trials.clear()
         self.attack_windows.clear()
@@ -1890,7 +1872,6 @@ class LiveTrainer:
         self.previous_action = None
         self.previous_illegal_penalty = 0.0
         self.previous_illegal_branches = ()
-        self.previous_taunt_started = False
         self.previous_started_branches = ()
         self.previous_charge_released = False
         self.previous_attack_opportunity = None

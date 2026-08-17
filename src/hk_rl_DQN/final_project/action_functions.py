@@ -43,8 +43,12 @@ def jump_hold(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[
     return _send(recorder, "jump_hold", duration_ms or 100)
 
 
-def dash(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
-    return _send(recorder, "dash", duration_ms or 80)
+def left_dash(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
+    return _send(recorder, "left_dash", duration_ms or 80)
+
+
+def right_dash(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
+    return _send(recorder, "right_dash", duration_ms or 80)
 
 
 def attack(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
@@ -69,10 +73,6 @@ def quick_cast(recorder: ActionRecorder, duration_ms: int | None = None) -> dict
 
 def harpoon_dash(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
     return _send(recorder, "harpoon_dash", duration_ms or 80)
-
-
-def taunt(recorder: ActionRecorder, duration_ms: int | None = None) -> dict[str, Any]:
-    return _send(recorder, "taunt", duration_ms or 80)
 
 
 ACTION_FUNCTIONS: dict[str, ActionFunction] = {

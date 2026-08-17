@@ -1,5 +1,7 @@
 # Live Joint-Action DQN
 
+Pure English project documentation is also available in [`README_EN.md`](README_EN.md).
+
 `hk_rl_DQN` is now the real-game Karmelita training pipeline. The old
 single-action simulator implementation is archived under
 `history/simulator_dqn_v1`.
@@ -15,28 +17,30 @@ The live pipeline is split by responsibility:
   never exposed to the DQN observation.
 - `final_project/action_executor.py`: three coordinated action fields,
   legality masks, held-key timing, and JSONL action records.
-- `real_dqn.py`: 147-action Dueling Double DQN, replay, checkpoints, and the
+- `real_dqn.py`: 53-action Dueling Double DQN, replay, checkpoints, and the
   telemetry training loop.
 - `tools/`: explicit cold-start state/action acceptance tests.
 
-The fixed action vector is `[3,7,7]` in this order: `jump_z, movement, combat`.
+The fixed action vector is `[3,6,6]` in this order: `jump_z, movement, combat`.
 `jump_z` is purely key based: release Z, press Z, or hold Z. Ground jump,
 double jump, and cloak hover are not separate actions. `movement` chooses
-neutral, held left/right, dash, a directed left/right dash, or S harpoon dash.
-`combat` chooses neutral, tap X, hold X, press Shift, press V, up+X, or down+X.
-The three fields are combined into one of `3 * 7 * 7 = 147` joint actions and
-receive one Q-value. Values within one field remain mutually exclusive.
-Harpoon dash is the deliberate exception: S is pulsed for
+neutral, held left/right, a directed left/right dash, or S harpoon dash.
+`combat` chooses neutral, tap X, hold X, press Shift, up+X, or down+X.
+The policy uses a curated catalog of 53 joint actions, and each complete action
+receives one Q-value. It excludes dash with charge/Shift/directional X, press-Z
+with tap X/Shift/directional X, and every non-atomic S combination.
+Harpoon dash is atomic: S is pulsed for
 one tick, jump/combat are neutralized on launch, and all fields remain neutral
-during its active/recovery lock. There is no dedicated wall-jump or sustained-run action.
-V is also atomic. The game FSM requires `CanCast`, no hard landing, and an
-on-ground player. V uses a fixed 1,000 ms stationary recovery lock and launches
-as `[0,0,4]`; jump and movement are neutral during launch and every recovery
-tick.
+during its active/recovery lock. There is no generic facing-based dash,
+dedicated wall-jump, sustained-run action, or V action.
 Healing key `A` is deliberately absent from the action space and all input
 adapters.
 The full protocol and rationale are in
 `final_project/BRANCHING_DQN_NOTES.md`.
+
+The Dueling Double DQN uses a shared `24 -> 96 -> 96` encoder, a scalar value
+head, and a 53-value joint-action advantage head. The model has 16,950 trainable
+parameters. It does not train three independent action heads.
 
 The 24-value state layout is:
 
@@ -86,28 +90,24 @@ ability-disable state, harpoon availability, and quick-cast availability.
 `CanHarpoonDash()` result and does not require silk;
 `spell_shift` is masked when silk is insufficient or the action is unavailable.
 
-The current reward protocol is `normalized-evade-budget-v22-evaluation`.
+The current reward protocol is `normalized-evade-budget-v23-curated-53`.
 Replay training starts at 1,000 transitions. The previous v19 schedule decayed
 epsilon across 200 completed episodes, not 500. Version 20 instead drives
 epsilon from training transitions: a normalized reciprocal curve falls quickly
-at first and then slowly from `0.60` to `0.02` across 150,000 transitions.
+at first and then slowly from `0.50` to `0.02` across 120,000 transitions.
 Exploration samples sparse legal branch combinations instead of uniformly
 randomizing every branch.
-Movement exploration weights left/right at 32% each, dash at 12%, directed
-dashes at 8% each, and S at 8%. Exploratory left/right actions persist for a
+Movement exploration weights left/right at 32 each, directed dashes at 8 each,
+and S at 8. Exploratory left/right actions persist for a
 total of 2-3 control ticks. Combat exploration weights tap X, hold X, Shift,
-taunt, up+X, and down+X as `30/8/8/1/20/20`, keeping taunt available without
-letting it dominate cold-start data.
+up+X, and down+X as `30/8/8/20/20`.
 Player damage is `-3.6` per lost health point. That fixed event budget is
 distributed across every pending transition in the two most recent contiguous
-macro-action segments. Forced-neutral V ticks retain V ownership, so a sequence
-ending in left movement then V penalizes the complete left and V segments.
-Damage during V also applies its separate `-1.0` per-HP taunt-risk penalty to
-the transition that launched V.
+macro-action segments.
 The plugin emits monotonic Boss `attack_id` events. An attack window starts at
-the Boss attack-intent event and remains open for 700 ms after the finish event.
+the Boss attack-intent event and remains open for 600 ms after the finish event.
 If the complete window is avoided, every action in the window receives part of
-one fixed `+0.6` budget. Linear weights fall from `1.0` for the first action to
+one fixed `+0.75` budget. Linear weights fall from `1.0` for the first action to
 `0.5` for the final action and are normalized before distribution. Combat,
 movement, jump, and neutral actions can all receive this credit, so attacking
 and dodging rewards can stack. A hit instead applies one normalized `-1.0`
@@ -115,7 +115,7 @@ failure budget across the window. Player damage
 applies one additional `-0.75`
 combat responsibility budget only to started X/Shift actions whose short
 recovery window overlapped an active Boss threat. It is not multiplied by HP.
-X and completed charge releases receive `-0.25`, while Shift receives `-0.5`,
+X and completed charge releases receive `-0.2`, while Shift receives `-0.8`,
 only when they started inside a confirmed vulnerable range, completed without
 interruption, and their 20-tick result window expires without Boss HP loss or a
 successful parry. S never receives an offensive-miss penalty.
@@ -126,7 +126,7 @@ Out-of-range attacks are hard-masked; predictive fringe attacks remain legal
 but are not treated as misses. S damage trains its joint action, but an S movement
 that deals no damage is not treated as an offensive miss. Telemetry counts
 `HeroController.NailParry()` events. A new event inside a Boss attack/combo window
-gives `+0.8` to the most recent X attack transition. The
+gives `+0.5` to the most recent X attack transition. The
 Boss `blocked` reaction is not used for this reward. Replay stores the executor's
 actual action after smoothing and temporal fragments. Delayed outcomes mutate
 only a pending-credit ledger; after the 20-tick attribution horizon, an
@@ -134,14 +134,14 @@ immutable scalar-reward transition is appended to replay. Unattributed damage
 or parry events are reported but do not reinforce the current unrelated action.
 Greedy jump and left/right movement receive a 200-300 ms minimum commitment.
 An active/closing Boss attack, player damage, or an invalid executed action may
-break the commitment early. Five seconds without Boss damage adds `-0.05`;
+break the commitment early. Five seconds without Boss damage adds `-0.5`;
 directional movement confined to 10% of arena width for about one second adds
-`-0.05` per later tick. Entering the large outer Boss-proximity zone gives `+0.005` once,
+`-0.05` per later tick. Entering the large outer Boss-proximity zone gives `+0.05` once,
 then locks until confirmed Boss damage refreshes it and the player leaves and
-re-enters. The outermost 10% at either arena boundary costs `-0.02` every tick.
+re-enters. The outermost 12% at either arena boundary costs `-0.2` every tick.
 Silk consumption costs `-0.04` per unit.
-Use `--reset` because checkpoint version 28 normalizes successful evade credit;
-version 27 replay must not be
+Use `--reset` because checkpoint version 30 uses the `96 x 96` network and the
+curated 53-action catalog; version 29 checkpoints and replay must not be
 reused.
 
 X charge is valid for a release window rather than one fixed duration. It
