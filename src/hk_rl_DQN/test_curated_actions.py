@@ -1,15 +1,18 @@
 from __future__ import annotations
 
-import unittest
+import io
 import random
+import unittest
 
 import torch
 
 from .final_project.action_executor import (
     BRANCH_SIZES,
+    KeyboardActionExecutor,
     action_keys,
     decode_actions,
 )
+from .final_project.action_recorder import ActionRecorder
 from .real_dqn import (
     JOINT_ACTIONS,
     JOINT_ACTION_COUNT,
@@ -65,7 +68,21 @@ class CuratedActionCatalogTests(unittest.TestCase):
         self.assertEqual(action_keys((0, 5, 0)), ("S",))
         self.assertEqual(action_keys((0, 0, 4)), ("UpArrow", "X"))
         self.assertEqual(action_keys((0, 0, 5)), ("DownArrow", "X"))
-        self.assertEqual(decode_actions((0, 3, 1)), ("left", "dash", "attack"))
+        self.assertEqual(decode_actions((0, 3, 1)), ("left_dash", "attack"))
+        self.assertEqual(decode_actions((0, 4, 1)), ("right_dash", "attack"))
+
+    def test_directional_dash_frame_can_be_recorded(self) -> None:
+        recorder = ActionRecorder.__new__(ActionRecorder)
+        recorder.stream = io.StringIO()
+        recorder.sequence = 0
+        executor = KeyboardActionExecutor(recorder=recorder)
+        masks = tuple(tuple(True for _ in range(size)) for size in BRANCH_SIZES)
+        item = executor.apply(
+            (0, 3, 1),
+            branch_masks=masks,
+        )
+        self.assertEqual(item["actions"], ["left_dash", "attack"])
+        self.assertEqual(item["keys"], ["LeftArrow", "C", "X"])
 
     def test_network_outputs_one_value_per_curated_action(self) -> None:
         output = JointDQN()(torch.zeros((2, STATE_DIMENSIONS)))

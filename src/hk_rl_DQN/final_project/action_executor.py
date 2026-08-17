@@ -197,9 +197,9 @@ def decode_actions(action: Sequence[int]) -> tuple[str, ...]:
     elif values[1] == 2:
         names.append("right")
     elif values[1] == 3:
-        names.extend(("left", "dash"))
+        names.append("left_dash")
     elif values[1] == 4:
-        names.extend(("right", "dash"))
+        names.append("right_dash")
     elif values[1] == 5:
         names.append("harpoon_dash")
     if values[2] == 1:
