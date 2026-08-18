@@ -35,29 +35,30 @@ from .real_reward import DODGE_REWARD, ILLEGAL_ACTION_PENALTY, RewardFrame, Rewa
 from .real_state import (
     ARENA_CENTER_X,
     ARENA_HALF_WIDTH,
+    COLLISION_RISK_INDEX,
     STATE_DIMENSIONS,
     StateFrame,
     encode_snapshot,
 )
 
 
-STATE_ENCODING = "real-telemetry-state-v14-curated-action-control-24"
+STATE_ENCODING = "real-telemetry-state-v15-collision-risk-split-spin-24"
 ALGORITHM = "joint-dueling-double-dqn"
-CHECKPOINT_VERSION = 30
+CHECKPOINT_VERSION = 31
 REPLAY_CHECKPOINT_VERSION = 3
-REWARD_PROTOCOL = "normalized-evade-budget-v23-curated-53"
+REWARD_PROTOCOL = "normalized-evade-budget-v24-harpoon-bonus-curated-53"
 HIDDEN_DIMENSIONS = (96, 96)
 LEARNING_RATE = 1e-4
-GAMMA = 0.99
+GAMMA = 0.995
 BATCH_SIZE = 128
 REPLAY_CAPACITY = 50_000
-REPLAY_WARMUP = 1_000
+REPLAY_WARMUP = 2_000
 PURE_EXPLORATION_STEPS = 0  # Compatibility only; exploration now decays by episode.
-TARGET_UPDATE_INTERVAL = 500
-EPSILON_START = 0.50
-EPSILON_END = 0.02
-EPSILON_DECAY_TRANSITIONS = 120_000
-EPSILON_RECIPROCAL_SHAPE = 3.0
+TARGET_UPDATE_INTERVAL = 1_000
+EPSILON_START = 0.60
+EPSILON_END = 0.05
+EPSILON_DECAY_TRANSITIONS = 600_000
+EPSILON_RECIPROCAL_SHAPE = 1.0
 EXPLORATION_ACTIVATION_RATES = (0.45, 0.85, 0.30)
 MOVEMENT_EXPLORATION_WEIGHTS = (0.0, 32.0, 32.0, 8.0, 8.0, 8.0)
 COMBAT_EXPLORATION_WEIGHTS = (0.0, 30.0, 8.0, 8.0, 20.0, 20.0)
@@ -76,24 +77,27 @@ ACTION_LABELS = (
 COMBAT_HURT_EVENT_PENALTY = -0.75
 EVADE_SUCCESS_REWARD = 0.75
 EVADE_FAILURE_PENALTY = -1.0
+HARPOON_SUCCESS_BONUS_FRACTION = 0.50
 ATTACK_END_GRACE_SECONDS = 0.6
-COMBAT_HURT_CREDIT_WINDOW_STEPS = 6
-CREDIT_FINALIZATION_STEPS = DAMAGE_CREDIT_WINDOW_STEPS = 20
-ATTACK_ANIMATION_COMMITMENT_STEPS = 2
-CHARGE_RELEASE_COMMITMENT_STEPS = 5
-SPELL_ANIMATION_COMMITMENT_STEPS = 3
+COMBAT_HURT_CREDIT_WINDOW_STEPS = 12
+COMBAT_HURT_CREDIT_DECAY = math.sqrt(0.85)
+CREDIT_FINALIZATION_STEPS = DAMAGE_CREDIT_WINDOW_STEPS = 40
+ATTACK_ANIMATION_COMMITMENT_STEPS = 4
+CHARGE_RELEASE_COMMITMENT_STEPS = 10
+SPELL_ANIMATION_COMMITMENT_STEPS = 6
 ATTACK_MISS_PENALTY = -0.2
 SPELL_MISS_PENALTY = -0.8
-LONG_NO_DAMAGE_STEPS = 50
+LONG_NO_DAMAGE_STEPS = 100
 LONG_NO_DAMAGE_PENALTY = -0.5
-STAGNATION_WINDOW_STEPS = 10
+STAGNATION_WINDOW_STEPS = 20
 STAGNATION_REGION_FRACTION = 0.1
-STAGNATION_PENALTY = -0.05
+STAGNATION_PENALTY = -0.025
 BOSS_PROXIMITY_REWARD = 0.05
 BOSS_PROXIMITY_X = 12.0
 BOSS_PROXIMITY_Y = 8.0
 ARENA_BOUNDARY_FRACTION = 0.12
-ARENA_BOUNDARY_PENALTY = -0.2
+ARENA_BOUNDARY_PENALTY = -0.1
+CONTACT_RISK_INCREASE_SCALE = -0.25
 EVALUATION_INTERVAL_EPISODES = 10
 GRADIENT_CLIP_NORM = 10.0
 BRANCH_INDEX = {name: index for index, name in enumerate(BRANCH_NAMES)}
@@ -123,7 +127,7 @@ PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "real_dqn.pt"
 DEFAULT_METRICS = PROJECT_ROOT / "runs" / "real_dqn.jsonl"
 DEFAULT_ACTION_LOG = PROJECT_ROOT / "runs" / "real_dqn_actions.jsonl"
-DEFAULT_CONTROL_TICK_MS = 100
+DEFAULT_CONTROL_TICK_MS = 50
 GAME_RELAUNCH_DELAY_SECONDS = 1.0
 GAME_RELAUNCH_WINDOW_SECONDS = 60.0
 MAX_GAME_RELAUNCHES_PER_WINDOW = 3
@@ -325,6 +329,41 @@ class Transition:
     @property
     def action_vector(self) -> tuple[int, ...]:
         return decode_joint_action(self.action)
+
+
+_MIRRORED_STATE_SIGN_INDICES = (0, 2, 4, 6, 9, 19)
+
+
+def mirror_observation(observation: Sequence[float]) -> tuple[float, ...]:
+    """Reflect an observation across the arena center line."""
+
+    if len(observation) != STATE_DIMENSIONS:
+        raise ValueError(f"expected {STATE_DIMENSIONS} state values")
+    values = [float(value) for value in observation]
+    for index in _MIRRORED_STATE_SIGN_INDICES:
+        values[index] = -values[index]
+    return tuple(values)
+
+
+def mirror_action(action: Sequence[int]) -> tuple[int, ...]:
+    jump, movement, combat = validate_action(action)
+    movement = {1: 2, 2: 1, 3: 4, 4: 3}.get(movement, movement)
+    return jump, movement, combat
+
+
+def mirror_transition(transition: Transition) -> Transition:
+    mirrored_mask = [False] * JOINT_ACTION_COUNT
+    for action_id, allowed in enumerate(transition.next_action_mask):
+        if allowed:
+            mirrored_mask[joint_action_id(mirror_action(decode_joint_action(action_id)))] = True
+    return Transition(
+        state=mirror_observation(transition.state),
+        action=joint_action_id(mirror_action(transition.action_vector)),
+        reward=transition.reward,
+        next_state=mirror_observation(transition.next_state),
+        done=transition.done,
+        next_action_mask=tuple(mirrored_mask),
+    )
 
 
 @dataclass
@@ -719,13 +758,13 @@ def select_action(
         selected_action = decode_joint_action(selected_id)
     if exploration_state is not None:
         if sticky_jump is None and selected_action[BRANCH_INDEX["jump_z"]] in (1, 2):
-            exploration_state.start_jump(rng.choice([1, 2]))
+            exploration_state.start_jump(rng.choice([3, 5]))
         if (
             sticky_movement is None
             and selected_action[BRANCH_INDEX["movement"]] in (1, 2)
         ):
             exploration_state.start(
-                selected_action[BRANCH_INDEX["movement"]], rng.choice([1, 2])
+                selected_action[BRANCH_INDEX["movement"]], rng.choice([3, 5])
             )
     if selected_q_values is not None:
         selected_q_values.append(
@@ -740,9 +779,15 @@ def optimize_model(
     optimizer: torch.optim.Optimizer,
     transitions: Sequence[Transition],
     device: torch.device,
+    symmetry_rng: random.Random | None = None,
 ) -> float:
     if not transitions:
         raise ValueError("transitions must not be empty")
+    if symmetry_rng is not None:
+        transitions = tuple(
+            mirror_transition(item) if symmetry_rng.random() < 0.5 else item
+            for item in transitions
+        )
     states = torch.tensor([item.state for item in transitions], dtype=torch.float32, device=device)
     actions = torch.tensor([item.action for item in transitions], dtype=torch.long, device=device)
     rewards = torch.tensor(
@@ -966,6 +1011,8 @@ class EpisodeMetrics:
     out_of_range_attack_frames: int = 0
     unattributed_dodges: int = 0
     harpoon_damage_reward: float = 0.0
+    harpoon_hit_bonus_reward: float = 0.0
+    harpoon_evade_bonus_reward: float = 0.0
     offensive_miss_penalty: float = 0.0
     dodges_by_attack: dict[str, int] = field(default_factory=dict)
     failed_dodges_by_attack: dict[str, int] = field(default_factory=dict)
@@ -979,6 +1026,7 @@ class EpisodeMetrics:
     boss_proximity_reward: float = 0.0
     boundary_events: int = 0
     boundary_penalty: float = 0.0
+    collision_risk_penalty: float = 0.0
 
     def as_dict(
         self,
@@ -1226,6 +1274,14 @@ class LiveTrainer:
             self.metrics.reward += ARENA_BOUNDARY_PENALTY
         self.current_macro_positions.append(player_x)
         movement = pending.transition.action_vector[BRANCH_INDEX["movement"]]
+        previous_risk = pending.transition.state[COLLISION_RISK_INDEX]
+        current_risk = pending.transition.next_state[COLLISION_RISK_INDEX]
+        risk_increase = max(0.0, current_risk - previous_risk)
+        if movement in (1, 2, 3, 4) and risk_increase > 0.0:
+            collision_penalty = CONTACT_RISK_INCREASE_SCALE * risk_increase
+            pending.add_reward(collision_penalty)
+            self.metrics.collision_risk_penalty += collision_penalty
+            self.metrics.reward += collision_penalty
         arena_width = 2.0 * ARENA_HALF_WIDTH
         stagnant = (
             movement in (1, 2, 3, 4)
@@ -1317,9 +1373,13 @@ class LiveTrainer:
                 share = reward.damage_reward / max(1, len(candidates))
                 for trial in candidates:
                     trial.hit = True
-                    trial.pending.add_reward(share)
                     if trial.action_kind == "harpoon":
+                        bonus = share * HARPOON_SUCCESS_BONUS_FRACTION
+                        trial.pending.add_reward(share + bonus)
                         self.metrics.harpoon_damage_reward += share
+                        self.metrics.harpoon_hit_bonus_reward += bonus
+                    else:
+                        trial.pending.add_reward(share)
                 self.metrics.damage_credit_reward += reward.damage_reward
             else:
                 self.metrics.unattributed_damage_reward += reward.damage_reward
@@ -1428,6 +1488,7 @@ class LiveTrainer:
             item.attack_ids.discard(attack_id)
         if not unique or not window.active_seen:
             return
+        harpoon_bonus = 0.0
         if window.hurt_player:
             weights = [
                 self._failed_evade_weight(item.transition.action_vector)
@@ -1449,6 +1510,17 @@ class LiveTrainer:
             for item, weight in zip(unique, weights):
                 value = EVADE_SUCCESS_REWARD * weight / total_weight
                 item.add_reward(value)
+            harpoon_items = [
+                item
+                for item in unique
+                if item.transition.action_vector[BRANCH_INDEX["movement"]] == 5
+            ]
+            if harpoon_items:
+                harpoon_bonus = (
+                    EVADE_SUCCESS_REWARD * HARPOON_SUCCESS_BONUS_FRACTION
+                )
+                for item in harpoon_items:
+                    item.add_reward(harpoon_bonus / len(harpoon_items))
         if window.hurt_player:
             self.metrics.failed_dodges += 1
             self.metrics.evade_failure_backfill_penalty += applied_budget
@@ -1460,10 +1532,11 @@ class LiveTrainer:
             self.metrics.dodge_reward += DODGE_REWARD
             self.metrics.dodge_backfill_reward += applied_budget
             self.metrics.movement_dodge_reward += applied_budget
+            self.metrics.harpoon_evade_bonus_reward += harpoon_bonus
             self.metrics.dodges_by_attack[window.attack_type] = (
                 self.metrics.dodges_by_attack.get(window.attack_type, 0) + 1
             )
-        self.metrics.reward += applied_budget
+        self.metrics.reward += applied_budget + harpoon_bonus
 
     def _mark_attack_finished(self, attack_id: int) -> None:
         if attack_id == 0:
@@ -1598,7 +1671,8 @@ class LiveTrainer:
         if not candidates:
             return
         weights = [
-            0.85 ** (COMBAT_HURT_CREDIT_WINDOW_STEPS - trial.remaining_steps)
+            COMBAT_HURT_CREDIT_DECAY
+            ** (COMBAT_HURT_CREDIT_WINDOW_STEPS - trial.remaining_steps)
             for trial in candidates
         ]
         penalty = COMBAT_HURT_EVENT_PENALTY
@@ -1744,6 +1818,7 @@ class LiveTrainer:
                         self.optimizer,
                         self.replay.sample(BATCH_SIZE, self.rng),
                         self.device,
+                        symmetry_rng=self.rng,
                     )
                     self.metrics.gradient_updates += 1
                     self.metrics.loss_total += loss

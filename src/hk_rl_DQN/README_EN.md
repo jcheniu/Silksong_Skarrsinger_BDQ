@@ -15,7 +15,7 @@ The observation contains 24 normalized values:
 motion:   player x/y, player vx/vy, relative Boss x/y,
           relative Boss-player vx/vy, grounded, player facing       (10)
 resource: normalized silk                                             (1)
-Boss:     behavior progress, attack category, aerial, displacement,
+Boss:     behavior progress, attack category, aerial, collision risk,
           vertical intent, hit pattern, combined status               (7)
 control:  previous jump, movement direction/mode, previous combat,
           X charge progress, harpoon phase                             (6)
@@ -72,7 +72,8 @@ executed after masks and temporal locks.
 - S is blocked during X charge and for 500 ms after a completed charge release.
 - Harpoon S owns a bounded 900 ms active/recovery lock and neutralizes the
   other fields during that lock.
-- Greedy jump and left/right movement receive a short 200-300 ms commitment,
+- The policy selects a new action every 50 ms. Greedy jump and left/right
+  movement retain a 200-300 ms commitment,
   which can be interrupted by danger, damage, or an invalid execution.
 
 ## Reward And Credit
@@ -80,7 +81,7 @@ executed after masks and temporal locks.
 Important current values are:
 
 ```text
-step penalty:                         -0.002
+step penalty:                         -0.001
 attack-range entry:                   +0.2
 confirmed Boss damage per HP:         +0.1
 player damage per HP:                 -3.6
@@ -94,15 +95,18 @@ combat threat-overlap responsibility: -0.75
 normal/charged X miss:                -0.2
 Shift miss:                           -0.8
 five seconds without Boss damage:     -0.5
-stagnation per later tick:            -0.05
+stagnation per later tick:            -0.025
 one-time Boss proximity entry:        +0.05
-arena boundary per tick:              -0.2
+arena boundary per tick:              -0.1
+collision-risk increase:              up to -0.25
+successful S hit bonus:               +50% of credited damage reward
+successful S evade bonus:             +50% of the evade budget
 ```
 
 Damage, parry, offensive-miss, player-hurt, and Boss-attack events can arrive
 after the responsible input. Transitions therefore remain mutable in a pending
-credit ledger for 20 control ticks. Only finalized immutable transitions enter
-replay.
+credit ledger for 40 control ticks. At 50 ms per tick this preserves the former
+two-second attribution horizon. Only finalized immutable transitions enter replay.
 
 A Boss attack remains open for 600 ms after its finish event so delayed player
 hit telemetry can resolve the outcome. A successful evade distributes one
@@ -117,11 +121,13 @@ Boss damage nor a parry during its result window.
 ## Exploration And Training
 
 The shared replay buffer holds 50,000 transitions. Optimization starts after
-1,000 transitions with batches of 128. The target network is updated every 500
+2,000 transitions with batches of 128. The target network is updated every 1,000
 training transitions.
 
-Epsilon follows a reciprocal transition-based schedule from `0.50` to `0.02`
-over 120,000 training transitions. Evaluation runs occur after every ten
+Epsilon follows a mild reciprocal transition-based schedule from `0.60` to
+`0.05` over 600,000 training transitions. Half of each sampled training batch
+is randomly reflected left-to-right, including its action and legality mask, so
+experience transfers between mirrored arena situations. Evaluation runs occur after every ten
 training episodes with epsilon fixed to zero. Evaluation episodes do not alter
 replay, optimizer state, global step, or the training episode count.
 
@@ -147,13 +153,15 @@ desktop work area.
 
 ## Checkpoints
 
-Checkpoint version 30 records:
+Checkpoint version 31 records:
 
 - the `96 x 96` network shape;
 - the complete ordered 53-action catalog;
 - state, action, reward, and replay protocol versions;
 - optimizer state, replay tensors, global step, and completed episodes.
 
+Version 31 also separates `spin_attack` from `cyclone`, replaces the coarse
+Boss-displacement bit with continuous collision risk, and uses 50 ms control.
 Older checkpoints are intentionally incompatible. Start the new architecture
 with:
 

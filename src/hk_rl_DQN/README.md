@@ -48,7 +48,7 @@ The 24-value state layout is:
 motion:  player x/y, player vx/vy, relative boss x/y,
          relative boss-player vx/vy, grounded, player facing       (10)
 resource: normalized silk                                           (1)
-boss: behavior progress, attack category, aerial, displacement,
+boss: behavior progress, attack category, aerial, collision risk,
       vertical intent, hit pattern, combined status                 (7)
 control: previous jump, movement direction/mode, previous combat,
          X charge progress, harpoon phase                            (6)
@@ -81,7 +81,7 @@ existing checkpoint stops with an error and is never replaced implicitly. Use
 optimizer state, global step, completed-episode count, and replay memory.
 Replay transitions are stored as compact tensors in the checkpoint, so a
 restarted process resumes sampling immediately instead of repeating the
-1,000-transition warmup. Checkpoints are written through a temporary file and
+2,000-transition warmup. Checkpoints are written through a temporary file and
 atomically replaced after serialization completes.
 
 Telemetry exposes current/effective maximum silk, silk parts, skill cost,
@@ -90,16 +90,18 @@ ability-disable state, harpoon availability, and quick-cast availability.
 `CanHarpoonDash()` result and does not require silk;
 `spell_shift` is masked when silk is insufficient or the action is unavailable.
 
-The current reward protocol is `normalized-evade-budget-v23-curated-53`.
-Replay training starts at 1,000 transitions. The previous v19 schedule decayed
-epsilon across 200 completed episodes, not 500. Version 20 instead drives
-epsilon from training transitions: a normalized reciprocal curve falls quickly
-at first and then slowly from `0.50` to `0.02` across 120,000 transitions.
+The current reward protocol is
+`normalized-evade-budget-v24-harpoon-bonus-curated-53`.
+Replay training starts at 2,000 transitions. Epsilon is driven by training
+transitions using a mild reciprocal curve from `0.60` to `0.05` across 600,000
+transitions. This keeps materially more exploration after the early policy has
+found a locally useful dodge pattern.
 Exploration samples sparse legal branch combinations instead of uniformly
 randomizing every branch.
 Movement exploration weights left/right at 32 each, directed dashes at 8 each,
-and S at 8. Exploratory left/right actions persist for a
-total of 2-3 control ticks. Combat exploration weights tap X, hold X, Shift,
+and S at 8. Exploratory left/right actions persist for a total of 4 or 6
+control ticks, preserving a 200-300 ms commitment at the 50 ms control rate.
+Combat exploration weights tap X, hold X, Shift,
 up+X, and down+X as `30/8/8/20/20`.
 Player damage is `-3.6` per lost health point. That fixed event budget is
 distributed across every pending transition in the two most recent contiguous
@@ -117,36 +119,44 @@ combat responsibility budget only to started X/Shift actions whose short
 recovery window overlapped an active Boss threat. It is not multiplied by HP.
 X and completed charge releases receive `-0.2`, while Shift receives `-0.8`,
 only when they started inside a confirmed vulnerable range, completed without
-interruption, and their 20-tick result window expires without Boss HP loss or a
+interruption, and their 40-tick result window expires without Boss HP loss or a
 successful parry. S never receives an offensive-miss penalty.
 The plugin's read-only `boss_vulnerable` flag comes directly from
 `HealthManager.IsInvincible`; it controls masks and credit eligibility without
 increasing the 24-value observation.
 Out-of-range attacks are hard-masked; predictive fringe attacks remain legal
-but are not treated as misses. S damage trains its joint action, but an S movement
-that deals no damage is not treated as an offensive miss. Telemetry counts
+but are not treated as misses. S damage trains its joint action with an extra
+50% hit bonus. If an attack window is successfully escaped with S, the S
+transition receives an extra 50% of the normal evade budget. An S movement that
+deals no damage is not treated as an offensive miss. Telemetry counts
 `HeroController.NailParry()` events. A new event inside a Boss attack/combo window
 gives `+0.5` to the most recent X attack transition. The
 Boss `blocked` reaction is not used for this reward. Replay stores the executor's
 actual action after smoothing and temporal fragments. Delayed outcomes mutate
-only a pending-credit ledger; after the 20-tick attribution horizon, an
+only a pending-credit ledger; after the 40-tick attribution horizon, an
 immutable scalar-reward transition is appended to replay. Unattributed damage
 or parry events are reported but do not reinforce the current unrelated action.
 Greedy jump and left/right movement receive a 200-300 ms minimum commitment.
 An active/closing Boss attack, player damage, or an invalid executed action may
 break the commitment early. Five seconds without Boss damage adds `-0.5`;
 directional movement confined to 10% of arena width for about one second adds
-`-0.05` per later tick. Entering the large outer Boss-proximity zone gives `+0.05` once,
+`-0.025` per later tick. Increasing the encoded close-range collision risk
+while walking or dashing adds up to `-0.25`. Entering the large outer
+Boss-proximity zone gives `+0.05` once,
 then locks until confirmed Boss damage refreshes it and the player leaves and
-re-enters. The outermost 12% at either arena boundary costs `-0.2` every tick.
+re-enters. The outermost 12% at either arena boundary costs `-0.1` every tick.
 Silk consumption costs `-0.04` per unit.
-Use `--reset` because checkpoint version 30 uses the `96 x 96` network and the
-curated 53-action catalog; version 29 checkpoints and replay must not be
-reused.
+The 24-value observation now gives `spin_attack` and `cyclone` distinct attack
+category values and replaces the coarse displacement flag with continuous
+collision risk. Training batches randomly mirror half their transitions across
+the arena center, including actions and legality masks, so left/right examples
+teach the corresponding reflected behavior. Use `--reset` because checkpoint
+version 31 changes state, timing, exploration, and reward semantics; version 30
+checkpoints and replay must not be reused.
 
 X charge is valid for a release window rather than one fixed duration. It
-becomes complete at 1,350 ms. With a 100 ms control tick, the first practical
-release decision is at 1,400 ms. It may remain held until 3,000 ms and is
+becomes complete at 1,350 ms. With a 50 ms control tick, the first practical
+release decision is at 1,350 ms. It may remain held until 3,000 ms and is
 forced to release at the maximum. S is masked throughout the hold and for 500 ms after a
 completed release, so harpoon movement cannot cancel the charge or its release
 animation. Once charging starts, combat is locked to hold X until the 1,350 ms
@@ -156,7 +166,7 @@ elapsed time normalized by the 3,000 ms maximum.
 Every completed episode reports `replay_size`, `global_step`,
 `gradient_updates`, `mean_loss`, the executor's `actual_action_counts` for
 each action field, and one `mean_policy_q` for the selected joint action. A null loss with replay below
-1,000 is expected because warmup has not completed. Loss is a moving TD target
+2,000 is expected because warmup has not completed. Loss is a moving TD target
 and is not expected to decrease monotonically between episodes.
 After every 10 training episodes, the next encounter is an independent greedy
 evaluation with epsilon zero. Evaluation rows have `"evaluation": true`; they

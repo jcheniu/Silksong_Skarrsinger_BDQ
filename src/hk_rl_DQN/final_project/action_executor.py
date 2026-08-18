@@ -303,7 +303,7 @@ class KeyboardActionExecutor:
     """Maintain desired key state across fixed-duration control ticks."""
 
     recorder: ActionRecorder
-    tick_ms: int = 100
+    tick_ms: int = 50
     send_input: bool = False
     harpoon_active_ms: int = 300
     harpoon_lock_ms: int = 900

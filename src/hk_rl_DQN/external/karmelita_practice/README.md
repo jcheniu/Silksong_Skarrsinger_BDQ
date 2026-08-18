@@ -49,7 +49,8 @@ Snapshots continue while the plugin is enabled but the encounter is inactive
 or transitioning. `encounter_id` increments whenever a newly loaded Boss
 encounter becomes active, allowing the trainer to distinguish a fresh fight
 from lingering terminal frames even if an inactive sample is missed.
-Sampling defaults to 100 ms. The settings are generated in the plugin config:
+Sampling defaults to 50 ms so state updates match the live controller tick.
+The settings are generated in the plugin config:
 
 ```json
 {
@@ -77,7 +78,7 @@ silk-ability disable flag, and `HeroController.CanThrowTool(false)`.
 ```ini
 [Telemetry]
 Enabled = true
-IntervalSeconds = 0.1
+IntervalSeconds = 0.05
 ```
 
 The recorder remains read-only. It observes FSM state and game events without

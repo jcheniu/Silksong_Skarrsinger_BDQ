@@ -8,6 +8,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 import json
+import math
 from pathlib import Path
 import re
 from typing import Iterable, Iterator, Mapping, TextIO
@@ -112,7 +113,7 @@ BOSS_SEMANTIC_FEATURES = (
     "behavior_progress",
     "attack_category",
     "aerial",
-    "displacement",
+    "collision_risk",
     "vertical_intent",
     "hit_pattern",
     "boss_status",
@@ -125,6 +126,11 @@ BASE_STATE_DIMENSIONS = (
 )
 CONTROL_STATE_DIMENSIONS = 6
 STATE_DIMENSIONS = BASE_STATE_DIMENSIONS + CONTROL_STATE_DIMENSIONS
+COLLISION_RISK_INDEX = (
+    KINEMATIC_STATE_DIMENSIONS
+    + RESOURCE_STATE_DIMENSIONS
+    + BOSS_SEMANTIC_FEATURES.index("collision_risk")
+)
 
 
 @dataclass(frozen=True)
@@ -304,43 +310,29 @@ def _boss_semantics(
     attack_phase: str,
     reaction: str,
     phase_event: str,
+    collision_risk: float,
 ) -> tuple[float, ...]:
     """Compress raw Boss FSM labels into continuous, interpretable features."""
 
     lowered = control_state.lower()
     if "air throw slash" in lowered:
-        attack_category = 6
+        attack_category = 7
     else:
         attack_category = {
             "none": 0,
             "slash": 1,
             "cyclone": 2,
-            "spin_attack": 2,
-            "ground_throw": 3,
-            "air_throw": 3,
-            "rethrow": 4,
-            "dash_grind": 5,
-            "jump_attack": 5,
-            "spear_slam": 5,
+            "spin_attack": 3,
+            "ground_throw": 4,
+            "air_throw": 4,
+            "rethrow": 5,
+            "dash_grind": 6,
+            "jump_attack": 6,
+            "spear_slam": 6,
         }[attack_type]
     aerial = any(
         token in lowered
         for token in ("air ", "jump", "launch", "fall", "spin attack")
-    )
-    displacement = any(
-        token in lowered
-        for token in (
-            "approach",
-            "movement",
-            "evade",
-            "dash",
-            "jump",
-            "launch",
-            "entry",
-            "fall",
-            "land",
-            "spin attack",
-        )
     )
     if any(token in lowered for token in ("fall", "land", "slam", "dive")):
         vertical_intent = -1.0
@@ -375,13 +367,39 @@ def _boss_semantics(
         boss_status = 0.0
     return (
         _sequence_progress(control_state, attack_phase),
-        attack_category / 6.0,
+        attack_category / 7.0,
         float(aerial),
-        float(displacement),
+        _clip(collision_risk, 0.0, 1.0),
         vertical_intent,
         hit_pattern,
         boss_status,
     )
+
+
+def _collision_risk(
+    relative_x: float,
+    relative_y: float,
+    relative_velocity_x: float,
+    relative_velocity_y: float,
+) -> float:
+    """Expose close-range collision danger without adding an observation."""
+
+    horizontal = max(0.0, 1.0 - abs(relative_x) / 8.0)
+    vertical = max(0.0, 1.0 - abs(relative_y) / 6.0)
+    proximity = horizontal * vertical
+    if proximity <= 0.0:
+        return 0.0
+    distance = math.hypot(relative_x, relative_y)
+    if distance <= 1e-6:
+        closing_speed = 0.0
+    else:
+        closing_speed = max(
+            0.0,
+            -(relative_x * relative_velocity_x + relative_y * relative_velocity_y)
+            / distance,
+        )
+    closing = closing_speed / (closing_speed + VELOCITY_X_SCALE)
+    return _clip(proximity * (0.75 + 0.25 * closing), 0.0, 1.0)
 
 
 def _position(entity: Mapping[str, object] | None, key: str) -> float:
@@ -484,7 +502,7 @@ def _classify_attack(state: str) -> tuple[str, str]:
             "spin recoil",
             "launch spin",
         )
-    ):
+    ) or lowered.startswith("launch"):
         attack = "spin_attack"
     elif "dash grind" in lowered or lowered == "dash":
         attack = "dash_grind"
@@ -596,6 +614,12 @@ def encode_snapshot(
             attack_phase,
             reaction,
             phase_event,
+            _collision_risk(
+                relative_x,
+                relative_y,
+                relative_velocity_x,
+                relative_velocity_y,
+            ),
         ),
         *(key_state or KeyHoldState()).as_tuple(),
     )

@@ -120,7 +120,7 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
             float interval = Config.Bind(
                 "Telemetry",
                 "IntervalSeconds",
-                0.1f,
+                0.05f,
                 "Seconds between telemetry snapshots."
             ).Value;
             telemetry = new TelemetryRecorder(interval);
@@ -677,6 +677,7 @@ public partial class KarmelitaPracticePlugin : BaseUnityPlugin
             lowered.Contains("spin attack") || lowered.Contains("spin antic")
             || lowered.Contains("spin dash") || lowered.Contains("spin multihit")
             || lowered.Contains("spin recoil") || lowered.Contains("launch spin")
+            || lowered.StartsWith("launch")
         ) attackType = "spin_attack";
         else if (lowered.Contains("dash grind") || lowered == "dash") attackType = "dash_grind";
         else if (lowered.Contains("spear slam")) attackType = "spear_slam";

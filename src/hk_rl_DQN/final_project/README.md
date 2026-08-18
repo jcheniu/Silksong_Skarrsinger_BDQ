@@ -43,8 +43,8 @@ The action catalog is in `action_catalog.py`. It uses the local bindings:
 - `LeftArrow` / `RightArrow` / `C` / `S`: one movement head with held
   direction, directed dash values, and harpoon dash
 - `X`: tap for normal attack, or keep the `attack_charge` intent present over
-  successive frames. Completion requires at least 1.35 s; with 100 ms control
-  ticks, the first practical release is at 1.4 s. It is forced to release at
+  successive frames. Completion requires at least 1.35 s; with 50 ms control
+  ticks, the first practical release is at 1.35 s. It is forced to release at
   3.0 s. S is blocked during the hold and for 500 ms after a
   completed release. Only a release at or after 1.35 s creates attack credit;
   the executor keeps X held until that minimum, while a hit interrupts and
@@ -57,8 +57,9 @@ The action catalog is in `action_catalog.py`. It uses the local bindings:
 - `S`: harpoon dash (`KeySupDash`); legality uses `CanHarpoonDash()` and does
   not depend on current silk. It belongs to the movement head because its
   displacement and recovery dominate its tactical effect. Boss damage is
-  credited to the movement transition, but an S movement that deals no damage
-  is not treated as an offensive miss. Holding S is bounded to 900 ms.
+  credited to the movement transition with a 50% S bonus, and a successful S
+  evade receives a 50% evade bonus. An S movement that deals no damage is not
+  treated as an offensive miss. Holding S is bounded to 900 ms.
 - `D`: disabled and never sent by the live policy
 - `V`: disabled and absent from the policy, executor, and reward protocol
 

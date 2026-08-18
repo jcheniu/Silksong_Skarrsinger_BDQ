@@ -22,7 +22,8 @@ joint-action advantage outputs.
 
 Damage, parry, offensive-miss, player-hurt, and Boss-attack outcomes can
 arrive several telemetry samples after the responsible action. New transitions
-therefore remain in a pending ledger for 20 control ticks. Delayed events alter
+therefore remain in a pending ledger for 40 control ticks. At the 50 ms control
+rate this retains the former two-second attribution horizon. Delayed events alter
 only the pending reward. Finalization creates an immutable `Transition` and
 appends it to replay; later events cannot mutate sampled training history.
 Player damage is distributed across every pending tick in the two latest
@@ -68,11 +69,13 @@ never penalized for missing.
 
 ## Temporal Actions
 
-- A charge becomes successful at 1350 ms. With 100 ms ticks, the earliest
-  practical release is 1400 ms and the maximum hold is 3000 ms.
+- A charge becomes successful at 1350 ms. With 50 ms ticks, the earliest
+  practical release is 1350 ms and the maximum hold is 3000 ms.
 - S is a movement-field harpoon dash. Its damage is credited normally, a miss
   is not penalized, and its displacement/recovery lock coordinates the other
-  fields.
+  fields. A confirmed S hit receives 50% extra credited damage reward; an S
+  that participates in a successful evade receives 50% of the evade budget as
+  an additional bonus.
 - S is suppressed during charge and for 500 ms after a completed release.
 - S is an atomic joint action. The catalog contains only `[0,5,0]`, and
   exploration canonicalizes it before execution.
@@ -82,5 +85,10 @@ never penalized for missing.
 Greedy jump and left/right actions are committed for 200-300 ms unless danger,
 damage, or an invalid execution requires an early break.
 
-Checkpoint version 30 is incompatible with the earlier network and action
-semantics. Start older runs with `--reset`.
+Training batches randomly mirror half their transitions across the arena center.
+The reflection swaps left/right movement and dash actions, signed horizontal
+state values, and the next-action mask. This transfers learned avoidance across
+equivalent left/right situations without changing the 24 inputs or 53 outputs.
+
+Checkpoint version 31 changes state, timing, exploration, and reward semantics.
+Start older runs with `--reset`.

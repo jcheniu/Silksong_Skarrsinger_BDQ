@@ -14,7 +14,9 @@ from typing import Mapping
 from .real_state import StateFrame, encode_snapshot
 
 
-STEP_PENALTY = -0.002
+# The 50 ms controller emits twice as many transitions as the old 100 ms
+# controller, so per-tick shaping is halved to preserve its per-second weight.
+STEP_PENALTY = -0.001
 ATTACK_RANGE_REWARD = 0.2
 DAMAGE_REWARD_PER_HP = 0.1
 ILLEGAL_ACTION_PENALTY = -1.0
