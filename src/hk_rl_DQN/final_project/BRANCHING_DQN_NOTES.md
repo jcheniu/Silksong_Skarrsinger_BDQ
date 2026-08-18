@@ -67,6 +67,24 @@ vulnerable, uninterrupted, completed actions can receive an offensive miss.
 Normal and charged X misses cost `-0.2`, Shift misses cost `-0.8`, and S is
 never penalized for missing.
 
+## Boss Zero Space
+
+The zero-space region is the lower half of a Boss-centered ellipse:
+
+```text
+dy >= 0
+(dx / 1.2)^2 + (dy / 1.6)^2 <= 1
+dx = boss_x - player_x
+dy = boss_y - player_y
+```
+
+All space above the Boss (`dy < 0`) is excluded so downward attacks and aerial
+crossing remain available. First entry costs `-0.5`; later 50 ms ticks cost
+`-0.025`. A player hit within 400 ms distributes one `-0.75` budget across
+recent zero-space transitions. Their Boss-damage reward, including delayed
+credit, is clawed back at 100%. Entering also removes an outstanding `+0.05`
+Boss-proximity reward from the current approach cycle.
+
 ## Temporal Actions
 
 - A charge becomes successful at 1350 ms. With 50 ms ticks, the earliest
@@ -90,5 +108,6 @@ The reflection swaps left/right movement and dash actions, signed horizontal
 state values, and the next-action mask. This transfers learned avoidance across
 equivalent left/right situations without changing the 24 inputs or 53 outputs.
 
-Checkpoint version 31 changes state, timing, exploration, and reward semantics.
+Checkpoint version 32 adds zero-space reward attribution and is incompatible
+with version 31 replay.
 Start older runs with `--reset`.

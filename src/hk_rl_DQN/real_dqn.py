@@ -4,8 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import deque
-from dataclasses import asdict, dataclass, field, replace
-from itertools import product
+from dataclasses import dataclass, replace
 import json
 import math
 from pathlib import Path
@@ -31,11 +30,85 @@ from .final_project.action_executor import (
     validate_masks,
 )
 from .final_project.action_recorder import ActionRecorder
-from .real_reward import DODGE_REWARD, ILLEGAL_ACTION_PENALTY, RewardFrame, RewardTracker
+from .real_actions import (
+    ACTION_LABELS,
+    BRANCH_INDEX,
+    COMBAT_EXPLORATION_WEIGHTS,
+    EPSILON_DECAY_TRANSITIONS,
+    EPSILON_END,
+    EPSILON_RECIPROCAL_SHAPE,
+    EPSILON_START,
+    EXPLORATION_ACTIVATION_RATES,
+    JOINT_ACTIONS,
+    JOINT_ACTION_COUNT,
+    JOINT_ACTION_INDEX,
+    MOVEMENT_EXPLORATION_WEIGHTS,
+    AttackOpportunity,
+    ActionExplorationState,
+    apply_attack_opportunity_mask,
+    attack_opportunity,
+    coordinate_temporal_action,
+    danger_requires_commitment_break,
+    decode_joint_action,
+    epsilon_for_transition,
+    joint_action_id,
+    joint_action_mask,
+    select_action,
+)
+from .real_replay import (
+    REPLAY_CAPACITY,
+    REPLAY_CHECKPOINT_VERSION,
+    ReplayBuffer,
+    Transition,
+    mirror_action,
+    mirror_observation,
+    mirror_transition,
+)
+from .real_reward import (
+    ARENA_BOUNDARY_PENALTY,
+    ARENA_BOUNDARY_FRACTION,
+    ATTACK_ANIMATION_COMMITMENT_STEPS,
+    ATTACK_END_GRACE_SECONDS,
+    ATTACK_MISS_PENALTY,
+    BOSS_PROXIMITY_REWARD,
+    BOSS_PROXIMITY_X,
+    BOSS_PROXIMITY_Y,
+    CHARGE_RELEASE_COMMITMENT_STEPS,
+    COMBAT_HURT_EVENT_PENALTY,
+    COMBAT_HURT_CREDIT_DECAY,
+    COMBAT_HURT_CREDIT_WINDOW_STEPS,
+    CONTACT_RISK_INCREASE_SCALE,
+    CREDIT_FINALIZATION_STEPS,
+    DAMAGE_CREDIT_WINDOW_STEPS,
+    DODGE_REWARD,
+    EVADE_FAILURE_PENALTY,
+    EVADE_SUCCESS_REWARD,
+    HARPOON_SUCCESS_BONUS_FRACTION,
+    ILLEGAL_ACTION_PENALTY,
+    LONG_NO_DAMAGE_PENALTY,
+    LONG_NO_DAMAGE_STEPS,
+    SPELL_MISS_PENALTY,
+    SPELL_ANIMATION_COMMITMENT_STEPS,
+    STAGNATION_REGION_FRACTION,
+    STAGNATION_PENALTY,
+    STAGNATION_WINDOW_STEPS,
+    ZERO_SPACE_HURT_WINDOW_SECONDS,
+    ZERO_SPACE_ENTRY_PENALTY,
+    ZERO_SPACE_HOLD_PENALTY,
+    ZERO_SPACE_HURT_PENALTY,
+    ZERO_SPACE_OFFENSIVE_CLAWBACK_FRACTION,
+    ZERO_SPACE_RADIUS_X,
+    ZERO_SPACE_RADIUS_Y,
+    ActionOutcomeTrial,
+    BossAttackCreditWindow,
+    CombatRiskTrial,
+    EpisodeMetrics,
+    PendingTransition,
+    RewardCreditMixin,
+    RewardFrame,
+    RewardTracker,
+)
 from .real_state import (
-    ARENA_CENTER_X,
-    ARENA_HALF_WIDTH,
-    COLLISION_RISK_INDEX,
     STATE_DIMENSIONS,
     StateFrame,
     encode_snapshot,
@@ -44,85 +117,17 @@ from .real_state import (
 
 STATE_ENCODING = "real-telemetry-state-v15-collision-risk-split-spin-24"
 ALGORITHM = "joint-dueling-double-dqn"
-CHECKPOINT_VERSION = 31
-REPLAY_CHECKPOINT_VERSION = 3
-REWARD_PROTOCOL = "normalized-evade-budget-v24-harpoon-bonus-curated-53"
+CHECKPOINT_VERSION = 32
+REWARD_PROTOCOL = "normalized-evade-budget-v25-zero-space-curated-53"
 HIDDEN_DIMENSIONS = (96, 96)
 LEARNING_RATE = 1e-4
 GAMMA = 0.995
 BATCH_SIZE = 128
-REPLAY_CAPACITY = 50_000
 REPLAY_WARMUP = 2_000
 PURE_EXPLORATION_STEPS = 0  # Compatibility only; exploration now decays by episode.
 TARGET_UPDATE_INTERVAL = 1_000
-EPSILON_START = 0.60
-EPSILON_END = 0.05
-EPSILON_DECAY_TRANSITIONS = 600_000
-EPSILON_RECIPROCAL_SHAPE = 1.0
-EXPLORATION_ACTIVATION_RATES = (0.45, 0.85, 0.30)
-MOVEMENT_EXPLORATION_WEIGHTS = (0.0, 32.0, 32.0, 8.0, 8.0, 8.0)
-COMBAT_EXPLORATION_WEIGHTS = (0.0, 30.0, 8.0, 8.0, 20.0, 20.0)
-ACTION_LABELS = (
-    ("released", "press_z", "hold_z"),
-    (
-        "neutral",
-        "hold_left",
-        "hold_right",
-        "left_dash",
-        "right_dash",
-        "harpoon_s",
-    ),
-    ("neutral", "tap_x", "hold_x", "shift", "up_x", "down_x"),
-)
-COMBAT_HURT_EVENT_PENALTY = -0.75
-EVADE_SUCCESS_REWARD = 0.75
-EVADE_FAILURE_PENALTY = -1.0
-HARPOON_SUCCESS_BONUS_FRACTION = 0.50
-ATTACK_END_GRACE_SECONDS = 0.6
-COMBAT_HURT_CREDIT_WINDOW_STEPS = 12
-COMBAT_HURT_CREDIT_DECAY = math.sqrt(0.85)
-CREDIT_FINALIZATION_STEPS = DAMAGE_CREDIT_WINDOW_STEPS = 40
-ATTACK_ANIMATION_COMMITMENT_STEPS = 4
-CHARGE_RELEASE_COMMITMENT_STEPS = 10
-SPELL_ANIMATION_COMMITMENT_STEPS = 6
-ATTACK_MISS_PENALTY = -0.2
-SPELL_MISS_PENALTY = -0.8
-LONG_NO_DAMAGE_STEPS = 100
-LONG_NO_DAMAGE_PENALTY = -0.5
-STAGNATION_WINDOW_STEPS = 20
-STAGNATION_REGION_FRACTION = 0.1
-STAGNATION_PENALTY = -0.025
-BOSS_PROXIMITY_REWARD = 0.05
-BOSS_PROXIMITY_X = 12.0
-BOSS_PROXIMITY_Y = 8.0
-ARENA_BOUNDARY_FRACTION = 0.12
-ARENA_BOUNDARY_PENALTY = -0.1
-CONTACT_RISK_INCREASE_SCALE = -0.25
 EVALUATION_INTERVAL_EPISODES = 10
 GRADIENT_CLIP_NORM = 10.0
-BRANCH_INDEX = {name: index for index, name in enumerate(BRANCH_NAMES)}
-
-
-def _policy_action_allowed(action: tuple[int, ...]) -> bool:
-    jump, movement, combat = action
-    if movement == 5:
-        return action == (0, 5, 0)
-    if movement in (3, 4) and combat not in (0, 1):
-        return False
-    if jump == 1 and combat not in (0, 2):
-        return False
-    return True
-
-
-JOINT_ACTIONS = tuple(
-    action
-    for action in product(*(range(size) for size in BRANCH_SIZES))
-    if _policy_action_allowed(action)
-)
-JOINT_ACTION_INDEX = {action: index for index, action in enumerate(JOINT_ACTIONS)}
-JOINT_ACTION_COUNT = len(JOINT_ACTIONS)
-if JOINT_ACTION_COUNT != 53:
-    raise AssertionError(f"curated action catalog has {JOINT_ACTION_COUNT} actions, expected 53")
 PROJECT_ROOT = Path(__file__).resolve().parents[2]
 DEFAULT_CHECKPOINT = PROJECT_ROOT / "checkpoints" / "real_dqn.pt"
 DEFAULT_METRICS = PROJECT_ROOT / "runs" / "real_dqn.jsonl"
@@ -172,605 +177,6 @@ class JointDQN(nn.Module):
 # Compatibility name retained for checkpoints/tests; the model has one
 # coordinated 53-action advantage output, not three independent Q heads.
 BranchingDQN = JointDQN
-
-
-def joint_action_id(action: Sequence[int]) -> int:
-    values = validate_action(action)
-    try:
-        return JOINT_ACTION_INDEX[values]
-    except KeyError:
-        raise ValueError(f"action is not in the curated joint catalog: {values}") from None
-
-
-def decode_joint_action(action_id: int) -> tuple[int, ...]:
-    if not 0 <= int(action_id) < JOINT_ACTION_COUNT:
-        raise ValueError(f"joint action must be in [0, {JOINT_ACTION_COUNT - 1}]")
-    return JOINT_ACTIONS[int(action_id)]
-
-
-def joint_action_mask(branch_masks: BranchMasks) -> tuple[bool, ...]:
-    masks = validate_masks(branch_masks)
-    return tuple(
-        all(masks[index][value] for index, value in enumerate(action))
-        for action in JOINT_ACTIONS
-    )
-
-
-def coordinate_temporal_action(action: Sequence[int]) -> tuple[int, ...]:
-    """Canonicalize atomic temporal actions before they reach the executor."""
-
-    jump, movement, combat = validate_action(action)
-    if movement == 5:
-        return (0, 5, 0)
-    return jump, movement, combat
-
-
-def _entity_value(entity: Mapping[str, object] | None, name: str) -> float:
-    if entity is None:
-        return 0.0
-    try:
-        return float(entity.get(name, 0.0))
-    except (TypeError, ValueError):
-        return 0.0
-
-
-def attack_opportunity(state: StateFrame) -> AttackOpportunity:
-    """Classify hard-blocked, predictive fringe, and confirmed attack zones."""
-
-    control = state.control_state.lower()
-    boss_vulnerable = (
-        state.boss is not None
-        and state.boss_vulnerable is not False
-        and state.reaction != "dead"
-        and state.phase_event == "none"
-        and not any(
-            token in control
-            for token in ("battle start", "entry", "roar", "hornet dead")
-        )
-    )
-    if not boss_vulnerable or state.player is None or state.boss is None:
-        return AttackOpportunity(False, False, False, False, False, False, False)
-
-    dx = _entity_value(state.boss, "x") - _entity_value(state.player, "x")
-    dy = _entity_value(state.boss, "y") - _entity_value(state.player, "y")
-    relative_vx = _entity_value(state.boss, "velocity_x") - _entity_value(
-        state.player, "velocity_x"
-    )
-    relative_vy = _entity_value(state.boss, "velocity_y") - _entity_value(
-        state.player, "velocity_y"
-    )
-    predicted_dx = dx + relative_vx * 0.15
-    predicted_dy = dy + relative_vy * 0.15
-    facing = _entity_value(state.player, "facing")
-    facing_target = facing == 0.0 or facing * predicted_dx >= -0.5
-    airborne = state.observation[8] < 0.5
-
-    horizontal_allowed = (
-        abs(predicted_dx) <= 8.0
-        and abs(predicted_dy) <= 4.5
-    )
-    horizontal_confirmed = (
-        abs(predicted_dx) <= 6.5
-        and abs(predicted_dy) <= 3.5
-        and facing_target
-    )
-    up_allowed = abs(predicted_dx) <= 4.0 and -0.5 <= predicted_dy <= 7.0
-    up_confirmed = abs(predicted_dx) <= 3.0 and 0.0 < predicted_dy <= 6.0
-    down_allowed = (
-        airborne
-        and abs(predicted_dx) <= 4.0
-        and -7.0 <= predicted_dy <= 0.5
-    )
-    down_confirmed = (
-        airborne
-        and abs(predicted_dx) <= 3.0
-        and -6.0 <= predicted_dy < 0.0
-    )
-    return AttackOpportunity(
-        True,
-        horizontal_allowed,
-        horizontal_confirmed,
-        up_allowed,
-        up_confirmed,
-        down_allowed,
-        down_confirmed,
-    )
-
-
-def apply_attack_opportunity_mask(
-    branch_masks: BranchMasks,
-    opportunity: AttackOpportunity,
-    continuing_action: Sequence[int],
-) -> tuple[BranchMasks, tuple[str, ...]]:
-    """Apply only the hard outer range; fringe attacks remain legal probes."""
-
-    masks = [list(branch) for branch in validate_masks(branch_masks)]
-    continuing = validate_action(continuing_action)
-    reasons: list[str] = []
-    for combat_action, label in ((1, "horizontal"), (4, "up"), (5, "down")):
-        if masks[BRANCH_INDEX["combat"]][combat_action] and not opportunity.allowed(
-            combat_action
-        ):
-            masks[BRANCH_INDEX["combat"]][combat_action] = False
-            reasons.append(f"{label} attack masked: outside predictive range")
-    if (
-        continuing[BRANCH_INDEX["combat"]] != 2
-        and masks[BRANCH_INDEX["combat"]][2]
-        and not opportunity.horizontal_allowed
-    ):
-        masks[BRANCH_INDEX["combat"]][2] = False
-        reasons.append("charge start masked: outside predictive range")
-    return validate_masks(masks), tuple(reasons)
-
-
-def danger_requires_commitment_break(state: StateFrame) -> bool:
-    if state.attack_phase == "active":
-        return True
-    if state.attack_phase != "anticipation" or state.player is None or state.boss is None:
-        return False
-    dx = _entity_value(state.boss, "x") - _entity_value(state.player, "x")
-    dy = _entity_value(state.boss, "y") - _entity_value(state.player, "y")
-    relative_vx = _entity_value(state.boss, "velocity_x") - _entity_value(
-        state.player, "velocity_x"
-    )
-    closing = dx == 0.0 or dx * relative_vx < 0.0
-    return closing and abs(dx) <= 10.0 and abs(dy) <= 7.0
-
-
-@dataclass(frozen=True)
-class Transition:
-    state: tuple[float, ...]
-    action: int
-    reward: float
-    next_state: tuple[float, ...]
-    done: bool
-    next_action_mask: tuple[bool, ...]
-
-    @property
-    def action_vector(self) -> tuple[int, ...]:
-        return decode_joint_action(self.action)
-
-
-_MIRRORED_STATE_SIGN_INDICES = (0, 2, 4, 6, 9, 19)
-
-
-def mirror_observation(observation: Sequence[float]) -> tuple[float, ...]:
-    """Reflect an observation across the arena center line."""
-
-    if len(observation) != STATE_DIMENSIONS:
-        raise ValueError(f"expected {STATE_DIMENSIONS} state values")
-    values = [float(value) for value in observation]
-    for index in _MIRRORED_STATE_SIGN_INDICES:
-        values[index] = -values[index]
-    return tuple(values)
-
-
-def mirror_action(action: Sequence[int]) -> tuple[int, ...]:
-    jump, movement, combat = validate_action(action)
-    movement = {1: 2, 2: 1, 3: 4, 4: 3}.get(movement, movement)
-    return jump, movement, combat
-
-
-def mirror_transition(transition: Transition) -> Transition:
-    mirrored_mask = [False] * JOINT_ACTION_COUNT
-    for action_id, allowed in enumerate(transition.next_action_mask):
-        if allowed:
-            mirrored_mask[joint_action_id(mirror_action(decode_joint_action(action_id)))] = True
-    return Transition(
-        state=mirror_observation(transition.state),
-        action=joint_action_id(mirror_action(transition.action_vector)),
-        reward=transition.reward,
-        next_state=mirror_observation(transition.next_state),
-        done=transition.done,
-        next_action_mask=tuple(mirrored_mask),
-    )
-
-
-@dataclass
-class ActionOutcomeTrial:
-    pending: "PendingTransition"
-    action_kind: str
-    penalize_miss: bool = True
-    remaining_steps: int = DAMAGE_CREDIT_WINDOW_STEPS
-    completion_steps: int = ATTACK_ANIMATION_COMMITMENT_STEPS
-    opportunity_confirmed: bool = False
-    completed: bool = False
-    interrupted: bool = False
-    hit: bool = False
-
-
-@dataclass
-class CombatRiskTrial:
-    pending: "PendingTransition"
-    action_kind: str
-    remaining_steps: int = COMBAT_HURT_CREDIT_WINDOW_STEPS
-    overlapped_active_threat: bool = False
-
-
-@dataclass
-class PendingTransition:
-    transition: Transition
-    created_step: int
-    macro_id: int = 0
-    attack_ids: set[int] = field(default_factory=set)
-    delayed_reward: float = 0.0
-
-    def add_reward(self, value: float) -> None:
-        self.delayed_reward += float(value)
-
-    def finalize(self) -> Transition:
-        return replace(
-            self.transition,
-            reward=self.transition.reward + self.delayed_reward,
-        )
-
-
-@dataclass
-class BossAttackCreditWindow:
-    attack_id: int
-    attack_type: str = "unknown"
-    active_seen: bool = False
-    hurt_player: bool = False
-    finished_step: int | None = None
-    transitions: list[PendingTransition] = field(default_factory=list)
-
-
-@dataclass(frozen=True)
-class AttackOpportunity:
-    """Three-zone attack geometry evaluated when an action starts."""
-
-    boss_vulnerable: bool
-    horizontal_allowed: bool
-    horizontal_confirmed: bool
-    up_allowed: bool
-    up_confirmed: bool
-    down_allowed: bool
-    down_confirmed: bool
-
-    def allowed(self, combat_action: int) -> bool:
-        if combat_action in (1, 2):
-            return self.horizontal_allowed
-        if combat_action == 4:
-            return self.up_allowed
-        if combat_action == 5:
-            return self.down_allowed
-        return True
-
-    def confirmed(self, combat_action: int) -> bool:
-        if combat_action in (1, 2):
-            return self.horizontal_confirmed
-        if combat_action == 4:
-            return self.up_confirmed
-        if combat_action == 5:
-            return self.down_confirmed
-        return self.boss_vulnerable
-
-
-@dataclass
-class ActionExplorationState:
-    """Short jump and direction commitment shared by explore and greedy play."""
-
-    sticky_movement: int = 0
-    movement_ticks: int = 0
-    sticky_jump: int = 0
-    jump_ticks: int = 0
-
-    @property
-    def remaining_ticks(self) -> int:
-        """Compatibility view used by existing movement tests and tooling."""
-
-        return self.movement_ticks
-
-    def consume_movement(self, mask: Sequence[bool]) -> int | None:
-        if self.movement_ticks <= 0 or self.sticky_movement not in (1, 2):
-            self.clear_movement()
-            return None
-        if not mask[self.sticky_movement]:
-            self.clear_movement()
-            return None
-        value = self.sticky_movement
-        self.movement_ticks -= 1
-        if self.movement_ticks == 0:
-            self.sticky_movement = 0
-        return value
-
-    def consume_jump(self, mask: Sequence[bool]) -> int | None:
-        if self.jump_ticks <= 0 or self.sticky_jump != 2:
-            self.clear_jump()
-            return None
-        if not mask[self.sticky_jump]:
-            self.clear_jump()
-            return None
-        self.jump_ticks -= 1
-        if self.jump_ticks == 0:
-            self.sticky_jump = 0
-        return 2
-
-    def start(self, movement: int, additional_ticks: int) -> None:
-        self.sticky_movement = movement
-        self.movement_ticks = additional_ticks
-
-    def start_jump(self, additional_ticks: int) -> None:
-        self.sticky_jump = 2
-        self.jump_ticks = additional_ticks
-
-    def reconcile(self, executed_action: Sequence[int]) -> None:
-        executed_jump, executed_movement, _combat = validate_action(executed_action)
-        if self.sticky_movement and executed_movement != self.sticky_movement:
-            self.clear_movement()
-        if self.sticky_jump and executed_jump not in (1, 2):
-            self.clear_jump()
-
-    def clear_movement(self) -> None:
-        self.sticky_movement = 0
-        self.movement_ticks = 0
-
-    def clear_jump(self) -> None:
-        self.sticky_jump = 0
-        self.jump_ticks = 0
-
-    def clear(self) -> None:
-        self.clear_movement()
-        self.clear_jump()
-
-
-class ReplayBuffer:
-    def __init__(self, capacity: int = REPLAY_CAPACITY) -> None:
-        if capacity <= 0:
-            raise ValueError("capacity must be positive")
-        self._items: deque[Transition] = deque(maxlen=capacity)
-
-    def append(self, transition: Transition) -> None:
-        if len(transition.state) != STATE_DIMENSIONS:
-            raise ValueError("invalid transition state dimensions")
-        if len(transition.next_state) != STATE_DIMENSIONS:
-            raise ValueError("invalid transition next-state dimensions")
-        decode_joint_action(transition.action)
-        if len(transition.next_action_mask) != JOINT_ACTION_COUNT:
-            raise ValueError("invalid joint action mask dimensions")
-        if not any(transition.next_action_mask):
-            raise ValueError("joint action mask must allow at least one action")
-        self._items.append(transition)
-
-    def sample(self, batch_size: int, rng: random.Random) -> list[Transition]:
-        if batch_size > len(self._items):
-            raise ValueError("batch size exceeds replay size")
-        return rng.sample(list(self._items), batch_size)
-
-    def __len__(self) -> int:
-        return len(self._items)
-
-    def clear(self) -> None:
-        self._items.clear()
-
-    def state_dict(self) -> dict[str, object]:
-        items = list(self._items)
-        return {
-            "version": REPLAY_CHECKPOINT_VERSION,
-            "capacity": self._items.maxlen,
-            "states": torch.tensor(
-                [item.state for item in items], dtype=torch.float32
-            ).reshape(-1, STATE_DIMENSIONS),
-            "actions": torch.tensor(
-                [item.action for item in items], dtype=torch.int16
-            ).reshape(-1),
-            "rewards": torch.tensor(
-                [item.reward for item in items], dtype=torch.float32
-            ),
-            "next_states": torch.tensor(
-                [item.next_state for item in items], dtype=torch.float32
-            ).reshape(-1, STATE_DIMENSIONS),
-            "dones": torch.tensor([item.done for item in items], dtype=torch.bool),
-            "next_action_masks": torch.tensor(
-                [item.next_action_mask for item in items], dtype=torch.bool
-            ).reshape(-1, JOINT_ACTION_COUNT),
-        }
-
-    def load_state_dict(self, data: Mapping[str, object]) -> None:
-        if data.get("version") != REPLAY_CHECKPOINT_VERSION:
-            raise ValueError("checkpoint replay version mismatch")
-        if data.get("capacity") != self._items.maxlen:
-            raise ValueError("checkpoint replay capacity mismatch")
-        required = (
-            "states",
-            "actions",
-            "rewards",
-            "next_states",
-            "dones",
-            "next_action_masks",
-        )
-        missing = [key for key in required if key not in data]
-        if missing:
-            raise ValueError(f"checkpoint replay fields are missing: {missing}")
-        states = torch.as_tensor(data.get("states")).cpu()
-        actions = torch.as_tensor(data.get("actions")).cpu()
-        rewards = torch.as_tensor(data.get("rewards")).cpu()
-        next_states = torch.as_tensor(data.get("next_states")).cpu()
-        dones = torch.as_tensor(data.get("dones")).cpu()
-        raw_masks = data.get("next_action_masks")
-        if raw_masks is None:
-            raise ValueError("checkpoint replay masks are missing")
-        masks = torch.as_tensor(raw_masks).cpu()
-        size = int(states.shape[0]) if states.ndim == 2 else -1
-        expected_shapes = (
-            states.shape == (size, STATE_DIMENSIONS),
-            actions.shape == (size,),
-            rewards.shape == (size,),
-            next_states.shape == (size, STATE_DIMENSIONS),
-            dones.shape == (size,),
-            masks.shape == (size, JOINT_ACTION_COUNT),
-        )
-        if not all(expected_shapes):
-            raise ValueError("checkpoint replay tensor dimensions are invalid")
-        if size > int(self._items.maxlen or 0):
-            raise ValueError("checkpoint replay exceeds configured capacity")
-        if not all(
-            torch.isfinite(values).all().item()
-            for values in (states, rewards, next_states)
-        ):
-            raise ValueError("checkpoint replay contains non-finite values")
-        self.clear()
-        for index in range(size):
-            self.append(
-                Transition(
-                    state=tuple(float(value) for value in states[index].tolist()),
-                    action=int(actions[index].item()),
-                    reward=float(rewards[index].item()),
-                    next_state=tuple(
-                        float(value) for value in next_states[index].tolist()
-                    ),
-                    done=bool(dones[index].item()),
-                    next_action_mask=tuple(
-                        bool(value) for value in masks[index].tolist()
-                    ),
-                )
-            )
-
-
-def epsilon_for_transition(transition: int) -> float:
-    fraction = min(1.0, max(0, transition) / EPSILON_DECAY_TRANSITIONS)
-    if fraction >= 1.0:
-        return EPSILON_END
-    floor = 1.0 / (1.0 + EPSILON_RECIPROCAL_SHAPE)
-    reciprocal = 1.0 / (1.0 + EPSILON_RECIPROCAL_SHAPE * fraction)
-    normalized = (reciprocal - floor) / (1.0 - floor)
-    return EPSILON_END + (EPSILON_START - EPSILON_END) * normalized
-
-
-def _weighted_exploration_choice(
-    candidates: Sequence[int],
-    weights: Sequence[float],
-    rng: random.Random,
-) -> int:
-    total_weight = sum(weights[index] for index in candidates)
-    if total_weight <= 0:
-        return rng.choice(list(candidates))
-    threshold = rng.random() * total_weight
-    selected = candidates[-1]
-    for candidate in candidates:
-        threshold -= weights[candidate]
-        if threshold < 0:
-            selected = candidate
-            break
-    return selected
-
-
-def select_action(
-    network: JointDQN,
-    observation: Sequence[float],
-    epsilon: float,
-    rng: random.Random,
-    device: torch.device,
-    branch_masks: BranchMasks | None = None,
-    exploration_state: ActionExplorationState | None = None,
-    selected_q_values: list[float] | None = None,
-) -> tuple[int, ...]:
-    if len(observation) != STATE_DIMENSIONS:
-        raise ValueError(f"expected {STATE_DIMENSIONS} state values")
-    with torch.no_grad():
-        values = network(
-            torch.tensor(observation, dtype=torch.float32, device=device).unsqueeze(0)
-        )
-    masks = (
-        validate_masks(branch_masks)
-        if branch_masks is not None
-        else tuple(
-            tuple(True for _ in range(size)) for size in BRANCH_SIZES
-        )
-    )
-    joint_mask = joint_action_mask(masks)
-    sticky_jump = (
-        exploration_state.consume_jump(masks[BRANCH_INDEX["jump_z"]])
-        if exploration_state is not None
-        else None
-    )
-    sticky_movement = (
-        exploration_state.consume_movement(masks[BRANCH_INDEX["movement"]])
-        if exploration_state is not None
-        else None
-    )
-    explore = rng.random() < epsilon
-    if explore:
-        legal_actions = [
-            action
-            for action, allowed in zip(JOINT_ACTIONS, joint_mask)
-            if allowed
-            and (sticky_jump is None or action[BRANCH_INDEX["jump_z"]] == sticky_jump)
-            and (
-                sticky_movement is None
-                or action[BRANCH_INDEX["movement"]] == sticky_movement
-            )
-        ]
-        if not legal_actions:
-            raise ValueError("curated action mask must allow at least one joint action")
-        selected_action = legal_actions[0]
-        for _attempt in range(100):
-            sampled: list[int] = []
-            for branch_index, (size, mask) in enumerate(zip(BRANCH_SIZES, masks)):
-                available = [index for index, allowed in enumerate(mask) if allowed]
-                if not available:
-                    raise ValueError("every action branch must have an available value")
-                if branch_index == BRANCH_INDEX["jump_z"] and sticky_jump is not None:
-                    sampled.append(sticky_jump)
-                    continue
-                if (
-                    branch_index == BRANCH_INDEX["movement"]
-                    and sticky_movement is not None
-                ):
-                    sampled.append(sticky_movement)
-                    continue
-                non_neutral = [index for index in available if index != 0]
-                activation_rate = EXPLORATION_ACTIVATION_RATES[branch_index]
-                if non_neutral and rng.random() < activation_rate:
-                    if branch_index == BRANCH_INDEX["movement"]:
-                        sampled.append(
-                            _weighted_exploration_choice(
-                                non_neutral, MOVEMENT_EXPLORATION_WEIGHTS, rng
-                            )
-                        )
-                    elif branch_index == BRANCH_INDEX["combat"]:
-                        sampled.append(
-                            _weighted_exploration_choice(
-                                non_neutral, COMBAT_EXPLORATION_WEIGHTS, rng
-                            )
-                        )
-                    else:
-                        sampled.append(rng.choice(non_neutral))
-                else:
-                    sampled.append(0 if 0 in available else rng.choice(available))
-            candidate = coordinate_temporal_action(sampled)
-            if candidate in legal_actions:
-                selected_action = candidate
-                break
-        else:
-            selected_action = rng.choice(legal_actions)
-        selected_id = joint_action_id(selected_action)
-    else:
-        scores = values.squeeze(0).clone()
-        legal = [
-            allowed
-            and (sticky_jump is None or action[BRANCH_INDEX["jump_z"]] == sticky_jump)
-            and (sticky_movement is None or action[BRANCH_INDEX["movement"]] == sticky_movement)
-            for action, allowed in zip(JOINT_ACTIONS, joint_mask)
-        ]
-        scores[torch.tensor([not allowed for allowed in legal], device=device)] = -torch.inf
-        selected_id = int(scores.argmax().item())
-        selected_action = decode_joint_action(selected_id)
-    if exploration_state is not None:
-        if sticky_jump is None and selected_action[BRANCH_INDEX["jump_z"]] in (1, 2):
-            exploration_state.start_jump(rng.choice([3, 5]))
-        if (
-            sticky_movement is None
-            and selected_action[BRANCH_INDEX["movement"]] in (1, 2)
-        ):
-            exploration_state.start(
-                selected_action[BRANCH_INDEX["movement"]], rng.choice([3, 5])
-            )
-    if selected_q_values is not None:
-        selected_q_values.append(
-            float(values[0, selected_id].detach().cpu().item())
-        )
-    return selected_action
 
 
 def optimize_model(
@@ -968,93 +374,6 @@ class TelemetryTail:
 
 
 @dataclass
-class EpisodeMetrics:
-    episode: int
-    evaluation: bool = False
-    steps: int = 0
-    reward: float = 0.0
-    gradient_updates: int = 0
-    loss_total: float = 0.0
-    actual_action_counts: dict[str, dict[str, int]] = field(default_factory=dict)
-    policy_q_total: float = 0.0
-    policy_q_samples: int = 0
-    damage_deal: int = 0
-    player_hurts: int = 0
-    player_damage_taken: int = 0
-    dodges: int = 0
-    won: bool = False
-    damage_reward: float = 0.0
-    dodge_reward: float = 0.0
-    attack_range_reward: float = 0.0
-    player_hurt_penalty: float = 0.0
-    victory_reward: float = 0.0
-    silk_spent: int = 0
-    silk_penalty: float = 0.0
-    dodge_backfill_reward: float = 0.0
-    movement_dodge_reward: float = 0.0
-    evade_failure_backfill_penalty: float = 0.0
-    combat_hurt_penalty: float = 0.0
-    failed_dodges: int = 0
-    damage_credit_reward: float = 0.0
-    unattributed_damage_reward: float = 0.0
-    player_parries: int = 0
-    parry_reward: float = 0.0
-    parry_credit_reward: float = 0.0
-    unattributed_parry_reward: float = 0.0
-    offensive_misses: int = 0
-    attack_misses: int = 0
-    spell_misses: int = 0
-    attack_opportunities: int = 0
-    confirmed_range_attacks: int = 0
-    fringe_range_attacks: int = 0
-    confirmed_range_misses: int = 0
-    out_of_range_attack_frames: int = 0
-    unattributed_dodges: int = 0
-    harpoon_damage_reward: float = 0.0
-    harpoon_hit_bonus_reward: float = 0.0
-    harpoon_evade_bonus_reward: float = 0.0
-    offensive_miss_penalty: float = 0.0
-    dodges_by_attack: dict[str, int] = field(default_factory=dict)
-    failed_dodges_by_attack: dict[str, int] = field(default_factory=dict)
-    illegal_actions: int = 0
-    illegal_action_penalty: float = 0.0
-    macro_hurt_penalty: float = 0.0
-    long_no_damage_events: int = 0
-    long_no_damage_penalty: float = 0.0
-    stagnation_events: int = 0
-    stagnation_penalty: float = 0.0
-    boss_proximity_reward: float = 0.0
-    boundary_events: int = 0
-    boundary_penalty: float = 0.0
-    collision_risk_penalty: float = 0.0
-
-    def as_dict(
-        self,
-        epsilon: float,
-        replay_size: int,
-        global_step: int,
-    ) -> dict[str, object]:
-        item = asdict(self)
-        item["mean_loss"] = (
-            self.loss_total / self.gradient_updates
-            if self.gradient_updates
-            else None
-        )
-        item["mean_policy_q"] = (
-            self.policy_q_total / self.policy_q_samples
-            if self.policy_q_samples
-            else None
-        )
-        item["epsilon"] = epsilon
-        item["replay_size"] = replay_size
-        item["global_step"] = global_step
-        del item["loss_total"]
-        del item["policy_q_total"]
-        del item["policy_q_samples"]
-        return item
-
-
-@dataclass
 class ArenaResetGate:
     """Ignore lingering terminal snapshots until the encounter actually exits."""
 
@@ -1101,7 +420,7 @@ class ArenaActionWatchdog:
         return timestamp - self.last_accepted_timestamp >= self.timeout_seconds
 
 
-class LiveTrainer:
+class LiveTrainer(RewardCreditMixin):
     """Stateful bridge joining telemetry, reward, joint DQN, replay, and actions."""
 
     def __init__(
@@ -1162,9 +481,19 @@ class LiveTrainer:
         self.credit_step = 0
         self.evaluation_mode = False
         self.proximity_reward_available = True
+        self.proximity_reward_balance = 0.0
         self.was_inside_boss_proximity = False
+        self.was_inside_zero_space = False
         self.attack_end_grace_steps = max(
             1, math.ceil(ATTACK_END_GRACE_SECONDS * 1000.0 / self.executor.tick_ms)
+        )
+        self.zero_space_hurt_window_steps = max(
+            1,
+            math.ceil(
+                ZERO_SPACE_HURT_WINDOW_SECONDS
+                * 1000.0
+                / self.executor.tick_ms
+            ),
         )
 
     def current_epsilon(self) -> float:
@@ -1180,548 +509,6 @@ class LiveTrainer:
             episode=self.completed_episodes,
             evaluation=True,
         )
-
-    @staticmethod
-    def _macro_key(
-        action: tuple[int, ...], temporal_owner: str | None = None
-    ) -> tuple[str, int]:
-        jump, movement, combat = action
-        if temporal_owner == "skill_s":
-            return ("movement", 5)
-        if combat != 0:
-            return ("combat", combat)
-        if movement != 0:
-            return ("movement", movement)
-        if jump != 0:
-            return ("jump", jump)
-        return ("neutral", 0)
-
-    def _record_macro_action(
-        self,
-        action: tuple[int, ...],
-        temporal_owner: str | None,
-        player_x: float,
-    ) -> None:
-        key = self._macro_key(action, temporal_owner)
-        if key != self.current_macro_key:
-            self.current_macro_key = key
-            self.previous_macro_id = self.next_macro_id
-            self.next_macro_id += 1
-            self.recent_macro_ids.append(self.previous_macro_id)
-            self.current_macro_positions.clear()
-            self.current_macro_positions.append(player_x)
-
-    def _apply_player_hurt_credit(self, reward: RewardFrame) -> None:
-        if reward.player_hurt >= 0:
-            return
-        macro_ids = set(self.recent_macro_ids)
-        candidates = [
-            item
-            for item in self.pending_credit_transitions
-            if item.macro_id in macro_ids
-        ]
-        if not candidates:
-            return
-        share = reward.player_hurt / len(candidates)
-        for item in candidates:
-            item.add_reward(share)
-        self.metrics.macro_hurt_penalty += reward.player_hurt
-        self.metrics.reward += reward.player_hurt
-
-    @staticmethod
-    def _inside_boss_proximity(state: StateFrame) -> bool:
-        if state.player is None or state.boss is None:
-            return False
-        dx = abs(_entity_value(state.boss, "x") - _entity_value(state.player, "x"))
-        dy = abs(_entity_value(state.boss, "y") - _entity_value(state.player, "y"))
-        inside_large_zone = dx <= BOSS_PROXIMITY_X and dy <= BOSS_PROXIMITY_Y
-        inside_close_zone = dx <= 6.0 and dy <= 5.0
-        return inside_large_zone and not inside_close_zone
-
-    def _apply_dense_shaping(
-        self,
-        reward: RewardFrame,
-        state: StateFrame,
-        pending: PendingTransition,
-    ) -> None:
-        if reward.damage_deal > 0:
-            self.no_damage_steps = 0
-            self.proximity_reward_available = True
-        else:
-            self.no_damage_steps += 1
-            if self.no_damage_steps % LONG_NO_DAMAGE_STEPS == 0:
-                pending.add_reward(LONG_NO_DAMAGE_PENALTY)
-                self.metrics.long_no_damage_events += 1
-                self.metrics.long_no_damage_penalty += LONG_NO_DAMAGE_PENALTY
-                self.metrics.reward += LONG_NO_DAMAGE_PENALTY
-
-        inside_proximity = self._inside_boss_proximity(state)
-        entered_proximity = inside_proximity and not self.was_inside_boss_proximity
-        if entered_proximity and self.proximity_reward_available:
-            pending.add_reward(BOSS_PROXIMITY_REWARD)
-            self.metrics.boss_proximity_reward += BOSS_PROXIMITY_REWARD
-            self.metrics.reward += BOSS_PROXIMITY_REWARD
-            self.proximity_reward_available = False
-        self.was_inside_boss_proximity = inside_proximity
-
-        player_x = _entity_value(state.player, "x")
-        normalized_player_x = abs((player_x - ARENA_CENTER_X) / ARENA_HALF_WIDTH)
-        boundary_threshold = 1.0 - 2.0 * ARENA_BOUNDARY_FRACTION
-        if normalized_player_x >= boundary_threshold:
-            pending.add_reward(ARENA_BOUNDARY_PENALTY)
-            self.metrics.boundary_events += 1
-            self.metrics.boundary_penalty += ARENA_BOUNDARY_PENALTY
-            self.metrics.reward += ARENA_BOUNDARY_PENALTY
-        self.current_macro_positions.append(player_x)
-        movement = pending.transition.action_vector[BRANCH_INDEX["movement"]]
-        previous_risk = pending.transition.state[COLLISION_RISK_INDEX]
-        current_risk = pending.transition.next_state[COLLISION_RISK_INDEX]
-        risk_increase = max(0.0, current_risk - previous_risk)
-        if movement in (1, 2, 3, 4) and risk_increase > 0.0:
-            collision_penalty = CONTACT_RISK_INCREASE_SCALE * risk_increase
-            pending.add_reward(collision_penalty)
-            self.metrics.collision_risk_penalty += collision_penalty
-            self.metrics.reward += collision_penalty
-        arena_width = 2.0 * ARENA_HALF_WIDTH
-        stagnant = (
-            movement in (1, 2, 3, 4)
-            and len(self.current_macro_positions) == self.current_macro_positions.maxlen
-            and max(self.current_macro_positions) - min(self.current_macro_positions)
-            <= arena_width * STAGNATION_REGION_FRACTION
-        )
-        if stagnant:
-            pending.add_reward(STAGNATION_PENALTY)
-            self.metrics.stagnation_events += 1
-            self.metrics.stagnation_penalty += STAGNATION_PENALTY
-            self.metrics.reward += STAGNATION_PENALTY
-
-    def _register_action_outcome(self, pending: PendingTransition) -> None:
-        action_kinds = {
-            "attack_x": ("attack", True),
-            "skill_s": ("harpoon", False),
-            "spell_shift": ("spell", True),
-        }
-        for event_name, (action_kind, penalize_miss) in action_kinds.items():
-            if event_name in self.previous_started_branches:
-                opportunity_confirmed = False
-                completion_steps = ATTACK_ANIMATION_COMMITMENT_STEPS
-                if action_kind == "attack":
-                    combat_action = (
-                        2
-                        if self.previous_charge_released
-                        else pending.transition.action_vector[BRANCH_INDEX["combat"]]
-                    )
-                    opportunity = self.previous_attack_opportunity
-                    opportunity_confirmed = bool(
-                        opportunity is not None
-                        and opportunity.confirmed(combat_action)
-                    )
-                    if self.previous_charge_released:
-                        completion_steps = CHARGE_RELEASE_COMMITMENT_STEPS
-                    self.metrics.attack_opportunities += 1
-                    if opportunity_confirmed:
-                        self.metrics.confirmed_range_attacks += 1
-                    else:
-                        self.metrics.fringe_range_attacks += 1
-                elif action_kind == "spell":
-                    completion_steps = SPELL_ANIMATION_COMMITMENT_STEPS
-                    opportunity_confirmed = bool(
-                        self.previous_attack_opportunity is not None
-                        and self.previous_attack_opportunity.boss_vulnerable
-                    )
-                self.action_outcome_trials.append(
-                    ActionOutcomeTrial(
-                        pending,
-                        action_kind,
-                        penalize_miss,
-                        completion_steps=completion_steps,
-                        opportunity_confirmed=opportunity_confirmed,
-                    )
-                )
-
-    def _penalize_offensive_miss(self, trial: ActionOutcomeTrial) -> None:
-        penalty = (
-            ATTACK_MISS_PENALTY
-            if trial.action_kind == "attack"
-            else SPELL_MISS_PENALTY
-        )
-        trial.pending.add_reward(penalty)
-        self.metrics.reward += penalty
-        self.metrics.offensive_misses += 1
-        self.metrics.offensive_miss_penalty += penalty
-        if trial.action_kind == "attack":
-            self.metrics.attack_misses += 1
-            self.metrics.confirmed_range_misses += 1
-        elif trial.action_kind == "spell":
-            self.metrics.spell_misses += 1
-
-    def _apply_action_outcomes(
-        self,
-        reward: RewardFrame,
-        state: StateFrame,
-    ) -> None:
-        if reward.damage_reward > 0:
-            if self.action_outcome_trials:
-                newest_remaining = max(
-                    trial.remaining_steps for trial in self.action_outcome_trials
-                )
-                candidates = [
-                    trial
-                    for trial in self.action_outcome_trials
-                    if trial.remaining_steps == newest_remaining
-                ]
-                share = reward.damage_reward / max(1, len(candidates))
-                for trial in candidates:
-                    trial.hit = True
-                    if trial.action_kind == "harpoon":
-                        bonus = share * HARPOON_SUCCESS_BONUS_FRACTION
-                        trial.pending.add_reward(share + bonus)
-                        self.metrics.harpoon_damage_reward += share
-                        self.metrics.harpoon_hit_bonus_reward += bonus
-                    else:
-                        trial.pending.add_reward(share)
-                self.metrics.damage_credit_reward += reward.damage_reward
-            else:
-                self.metrics.unattributed_damage_reward += reward.damage_reward
-
-        if reward.parry_reward > 0:
-            attack_trials = [
-                trial
-                for trial in self.action_outcome_trials
-                if trial.action_kind == "attack"
-            ]
-            if attack_trials:
-                newest_remaining = max(
-                    trial.remaining_steps for trial in attack_trials
-                )
-                candidates = [
-                    trial
-                    for trial in attack_trials
-                    if trial.remaining_steps == newest_remaining
-                ]
-                share = reward.parry_reward / max(1, len(candidates))
-                for trial in candidates:
-                    trial.hit = True
-                    trial.pending.add_reward(share)
-                self.metrics.parry_credit_reward += reward.parry_reward
-            else:
-                self.metrics.unattributed_parry_reward += reward.parry_reward
-
-        remaining: list[ActionOutcomeTrial] = []
-        for trial in self.action_outcome_trials:
-            if not trial.completed and not trial.interrupted:
-                if reward.player_damage_taken > 0 or reward.terminated:
-                    trial.interrupted = True
-                elif state.phase_event != "none" or state.reaction == "dead":
-                    trial.interrupted = True
-                else:
-                    trial.completion_steps -= 1
-                    trial.completed = trial.completion_steps <= 0
-            trial.remaining_steps -= 1
-            if trial.remaining_steps > 0:
-                remaining.append(trial)
-                continue
-            if (
-                not trial.hit
-                and trial.penalize_miss
-                and trial.opportunity_confirmed
-                and trial.completed
-                and not trial.interrupted
-            ):
-                self._penalize_offensive_miss(trial)
-        self.action_outcome_trials = remaining
-
-    @staticmethod
-    def _attack_credit_weight(action: tuple[int, ...]) -> float:
-        jump, movement, _combat = action
-        weight = 0.0
-        if jump != 0:
-            weight += 1.0
-        if movement in (3, 4, 5):
-            weight += 1.0
-        elif movement in (1, 2):
-            weight += 0.7
-        return weight
-
-    @staticmethod
-    def _successful_evade_action(action: tuple[int, ...]) -> bool:
-        jump, movement, combat = action
-        return combat == 0 and (jump != 0 or movement in (1, 2, 3, 4, 5))
-
-    @classmethod
-    def _failed_evade_weight(cls, action: tuple[int, ...]) -> float:
-        defensive_weight = cls._attack_credit_weight(action)
-        return defensive_weight if defensive_weight > 0 else 0.25
-
-    def _window(self, attack_id: int, attack_type: str = "unknown") -> BossAttackCreditWindow:
-        window = self.attack_windows.get(attack_id)
-        if window is None:
-            window = BossAttackCreditWindow(attack_id, attack_type)
-            self.attack_windows[attack_id] = window
-        elif window.attack_type == "unknown" and attack_type != "unknown":
-            window.attack_type = attack_type
-        return window
-
-    def _attach_to_attack(
-        self,
-        pending: PendingTransition,
-        attack_id: int,
-        attack_type: str = "unknown",
-    ) -> None:
-        if attack_id == 0 or attack_id in pending.attack_ids:
-            return
-        window = self._window(attack_id, attack_type)
-        window.transitions.append(pending)
-        pending.attack_ids.add(attack_id)
-
-    def _resolve_attack_window(self, attack_id: int) -> None:
-        window = self.attack_windows.pop(attack_id, None)
-        if window is None:
-            return
-        unique = []
-        seen: set[int] = set()
-        for item in window.transitions:
-            marker = id(item)
-            if marker not in seen:
-                seen.add(marker)
-                unique.append(item)
-            item.attack_ids.discard(attack_id)
-        if not unique or not window.active_seen:
-            return
-        harpoon_bonus = 0.0
-        if window.hurt_player:
-            weights = [
-                self._failed_evade_weight(item.transition.action_vector)
-                for item in unique
-            ]
-            total_weight = sum(weights)
-            applied_budget = EVADE_FAILURE_PENALTY if total_weight > 0 else 0.0
-            if total_weight > 0:
-                for item, weight in zip(unique, weights):
-                    item.add_reward(EVADE_FAILURE_PENALTY * weight / total_weight)
-        else:
-            final_index = max(1, len(unique) - 1)
-            weights = [
-                1.0 - 0.5 * index / final_index
-                for index in range(len(unique))
-            ]
-            total_weight = sum(weights)
-            applied_budget = EVADE_SUCCESS_REWARD if total_weight > 0 else 0.0
-            for item, weight in zip(unique, weights):
-                value = EVADE_SUCCESS_REWARD * weight / total_weight
-                item.add_reward(value)
-            harpoon_items = [
-                item
-                for item in unique
-                if item.transition.action_vector[BRANCH_INDEX["movement"]] == 5
-            ]
-            if harpoon_items:
-                harpoon_bonus = (
-                    EVADE_SUCCESS_REWARD * HARPOON_SUCCESS_BONUS_FRACTION
-                )
-                for item in harpoon_items:
-                    item.add_reward(harpoon_bonus / len(harpoon_items))
-        if window.hurt_player:
-            self.metrics.failed_dodges += 1
-            self.metrics.evade_failure_backfill_penalty += applied_budget
-            self.metrics.failed_dodges_by_attack[window.attack_type] = (
-                self.metrics.failed_dodges_by_attack.get(window.attack_type, 0) + 1
-            )
-        else:
-            self.metrics.dodges += 1
-            self.metrics.dodge_reward += DODGE_REWARD
-            self.metrics.dodge_backfill_reward += applied_budget
-            self.metrics.movement_dodge_reward += applied_budget
-            self.metrics.harpoon_evade_bonus_reward += harpoon_bonus
-            self.metrics.dodges_by_attack[window.attack_type] = (
-                self.metrics.dodges_by_attack.get(window.attack_type, 0) + 1
-            )
-        self.metrics.reward += applied_budget + harpoon_bonus
-
-    def _mark_attack_finished(self, attack_id: int) -> None:
-        if attack_id == 0:
-            return
-        window = self._window(attack_id)
-        if window.finished_step is None:
-            window.finished_step = self.credit_step
-
-    def _resolve_mature_attack_windows(self) -> None:
-        mature = [
-            attack_id
-            for attack_id, window in self.attack_windows.items()
-            if window.finished_step is not None
-            and self.credit_step - window.finished_step >= self.attack_end_grace_steps
-        ]
-        for attack_id in mature:
-            self._resolve_attack_window(attack_id)
-
-    @staticmethod
-    def _counter(mapping: Mapping[str, object], name: str) -> int:
-        value = mapping.get(name, 0)
-        if isinstance(value, bool):
-            return 0
-        try:
-            return max(0, int(value))
-        except (TypeError, ValueError):
-            return 0
-
-    def _apply_attack_events(
-        self,
-        snapshot: Mapping[str, object],
-        state: StateFrame,
-        reward: RewardFrame,
-        pending: PendingTransition,
-    ) -> None:
-        for attack_id, window in tuple(self.attack_windows.items()):
-            if window.finished_step is not None:
-                self._attach_to_attack(pending, attack_id, window.attack_type)
-
-        raw = snapshot.get("boss_attack")
-        if isinstance(raw, Mapping):
-            attack_id = self._counter(raw, "id")
-            attack_type = str(raw.get("type", "unknown"))
-            phase = str(raw.get("phase", "idle"))
-            if not self.attack_events_initialized:
-                for name in self.attack_event_counters:
-                    self.attack_event_counters[name] = self._counter(raw, name)
-                self.attack_events_initialized = True
-                self.active_attack_id = attack_id
-                if attack_id:
-                    window = self._window(attack_id, attack_type)
-                    window.active_seen |= phase == "active"
-                    window.hurt_player |= reward.player_damage_taken > 0
-                    self._attach_to_attack(pending, attack_id, attack_type)
-                return
-            if self.active_attack_id:
-                self._attach_to_attack(pending, self.active_attack_id)
-            if attack_id:
-                window = self._window(attack_id, attack_type)
-                window.active_seen |= phase == "active"
-                window.hurt_player |= reward.player_damage_taken > 0
-                self._attach_to_attack(pending, attack_id, attack_type)
-            hit_count = self._counter(raw, "player_hit_events")
-            if hit_count > self.attack_event_counters["player_hit_events"]:
-                hit_id = self._counter(raw, "last_player_hit_id")
-                if hit_id:
-                    late_window = self._window(hit_id)
-                    late_window.hurt_player = True
-                    self._attach_to_attack(pending, hit_id)
-            active_count = self._counter(raw, "active_events")
-            if active_count > self.attack_event_counters["active_events"]:
-                if attack_id:
-                    self._window(attack_id, attack_type).active_seen = True
-            finished_count = self._counter(raw, "finished_events")
-            if finished_count > self.attack_event_counters["finished_events"]:
-                finished_id = self._counter(raw, "last_finished_id")
-                if finished_id:
-                    self._mark_attack_finished(finished_id)
-            for name in self.attack_event_counters:
-                self.attack_event_counters[name] = self._counter(raw, name)
-            self.active_attack_id = attack_id
-            return
-
-        if state.attack_type != "none":
-            if self.active_attack_id == 0:
-                self.synthetic_attack_id -= 1
-                self.active_attack_id = self.synthetic_attack_id
-            window = self._window(self.active_attack_id, state.attack_type)
-            window.active_seen |= state.attack_phase == "active"
-            window.hurt_player |= reward.player_damage_taken > 0
-            self._attach_to_attack(pending, self.active_attack_id, state.attack_type)
-        elif self.active_attack_id and reward.attack_finished is not None:
-            window = self._window(self.active_attack_id, reward.attack_finished)
-            window.hurt_player |= reward.attack_hurt_player
-            self._attach_to_attack(pending, self.active_attack_id)
-            self._mark_attack_finished(self.active_attack_id)
-            self.active_attack_id = 0
-
-    def _register_combat_risk(self, pending: PendingTransition) -> None:
-        event_kinds = {
-            "attack_x": "attack",
-            "spell_shift": "spell",
-        }
-        for event_name, action_kind in event_kinds.items():
-            if event_name in self.previous_started_branches:
-                self.combat_risk_trials.append(
-                    CombatRiskTrial(pending, action_kind)
-                )
-
-    def _update_combat_risk_overlap(
-        self,
-        snapshot: Mapping[str, object],
-        state: StateFrame,
-    ) -> None:
-        raw_attack = snapshot.get("boss_attack")
-        explicit_active = (
-            isinstance(raw_attack, Mapping)
-            and str(raw_attack.get("phase", "idle")) == "active"
-        )
-        if explicit_active or state.attack_phase == "active":
-            for trial in self.combat_risk_trials:
-                trial.overlapped_active_threat = True
-
-    def _apply_combat_hurt(self, player_damage_taken: int) -> None:
-        if player_damage_taken <= 0:
-            return
-        candidates = [
-            trial
-            for trial in self.combat_risk_trials
-            if trial.overlapped_active_threat
-        ]
-        if not candidates:
-            return
-        weights = [
-            COMBAT_HURT_CREDIT_DECAY
-            ** (COMBAT_HURT_CREDIT_WINDOW_STEPS - trial.remaining_steps)
-            for trial in candidates
-        ]
-        penalty = COMBAT_HURT_EVENT_PENALTY
-        total_weight = sum(weights)
-        for trial, weight in zip(candidates, weights):
-            trial.pending.add_reward(penalty * weight / total_weight)
-        self.metrics.combat_hurt_penalty += penalty
-        self.metrics.reward += penalty
-
-    def _age_combat_risks(self) -> None:
-        remaining = []
-        for trial in self.combat_risk_trials:
-            trial.remaining_steps -= 1
-            if trial.remaining_steps > 0:
-                remaining.append(trial)
-        self.combat_risk_trials = remaining
-
-    def _finalize_pending(self, force: bool = False) -> None:
-        if force:
-            for attack_id in list(self.attack_windows):
-                self._resolve_attack_window(attack_id)
-        retained: deque[PendingTransition] = deque()
-        for pending in self.pending_credit_transitions:
-            age = self.credit_step - pending.created_step
-            ready = (
-                age >= CREDIT_FINALIZATION_STEPS
-                and not pending.attack_ids
-            )
-            if force or ready:
-                finalized = pending.finalize()
-                if not self.evaluation_mode:
-                    self.replay.append(finalized)
-                self.episode_finalized_reward += finalized.reward
-            else:
-                retained.append(pending)
-        self.pending_credit_transitions = retained
-
-    def _expire_action_outcomes(self) -> None:
-        for trial in self.action_outcome_trials:
-            if (
-                trial.hit
-                or not trial.penalize_miss
-                or not trial.opportunity_confirmed
-                or not trial.completed
-                or trial.interrupted
-            ):
-                continue
-            self._penalize_offensive_miss(trial)
-        self.action_outcome_trials.clear()
 
     def observe(
         self,
@@ -1796,8 +583,10 @@ class LiveTrainer:
             if self.previous_illegal_penalty < 0:
                 self.metrics.illegal_actions += 1
                 self.metrics.illegal_action_penalty += self.previous_illegal_penalty
+            self._apply_zero_space_shaping(state, pending)
             self._apply_action_outcomes(reward, state)
             self._apply_player_hurt_credit(reward)
+            self._apply_zero_space_hurt_credit(reward)
             self._apply_dense_shaping(reward, state, pending)
             if reward.player_damage_taken > 0:
                 self.current_macro_key = None
@@ -1927,7 +716,9 @@ class LiveTrainer:
         self.episode_finalized_reward = 0.0
         self.credit_step = 0
         self.proximity_reward_available = True
+        self.proximity_reward_balance = 0.0
         self.was_inside_boss_proximity = False
+        self.was_inside_zero_space = False
         self.metrics = EpisodeMetrics(episode=self.completed_episodes + 1)
         return result
 
@@ -1959,7 +750,9 @@ class LiveTrainer:
         self.episode_finalized_reward = 0.0
         self.credit_step = 0
         self.proximity_reward_available = True
+        self.proximity_reward_balance = 0.0
         self.was_inside_boss_proximity = False
+        self.was_inside_zero_space = False
         self.metrics = EpisodeMetrics(
             episode=(self.completed_episodes if self.evaluation_mode else self.completed_episodes + 1),
             evaluation=self.evaluation_mode,

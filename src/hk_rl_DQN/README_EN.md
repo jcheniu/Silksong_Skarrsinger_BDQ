@@ -101,6 +101,10 @@ arena boundary per tick:              -0.1
 collision-risk increase:              up to -0.25
 successful S hit bonus:               +50% of credited damage reward
 successful S evade bonus:             +50% of the evade budget
+zero-space entry:                      -0.5
+zero-space later tick:                 -0.025
+zero-space attributed hurt:            -0.75
+zero-space offensive clawback:         100%
 ```
 
 Damage, parry, offensive-miss, player-hurt, and Boss-attack events can arrive
@@ -117,6 +121,13 @@ Clearly unreachable attacks are masked. Predictive fringe attacks remain legal
 without miss punishment. A miss penalty is applied only when the attack began
 inside confirmed range, completed without interruption, and produced neither
 Boss damage nor a parry during its result window.
+
+Zero space is the lower half of a Boss-centered ellipse. Its horizontal radius
+is `1.2`, its downward radius is `1.6`, and all space above the Boss is safe.
+Entering costs `-0.5`; subsequent 50 ms ticks cost `-0.025`. Damage taken within
+400 ms adds a fixed `-0.75` budget across recent zero-space transitions and
+claws back 100% of their credited Boss-damage reward. Delayed damage credit is
+also clawed back. Entry removes any outstanding `+0.05` proximity reward.
 
 ## Exploration And Training
 
@@ -153,15 +164,15 @@ desktop work area.
 
 ## Checkpoints
 
-Checkpoint version 31 records:
+Checkpoint version 32 records:
 
 - the `96 x 96` network shape;
 - the complete ordered 53-action catalog;
 - state, action, reward, and replay protocol versions;
 - optimizer state, replay tensors, global step, and completed episodes.
 
-Version 31 also separates `spin_attack` from `cyclone`, replaces the coarse
-Boss-displacement bit with continuous collision risk, and uses 50 ms control.
+Version 32 adds lower-half-ellipse zero-space attribution on top of the version
+31 state encoding and 50 ms control protocol.
 Older checkpoints are intentionally incompatible. Start the new architecture
 with:
 
@@ -192,11 +203,16 @@ shape.
 
 ```text
 real_state.py                         telemetry -> 24-value observation
-real_reward.py                        immediate event rewards
-real_dqn.py                           network, replay, delayed credit, trainer
+real_actions.py                       action catalog, masks, exploration/selection
+real_replay.py                        transitions, replay, mirror augmentation
+real_reward.py                        immediate and delayed reward attribution
+real_dqn.py                           network, optimizer, checkpoints, trainer/CLI
 final_project/action_executor.py      masks, timing, keyboard execution
 final_project/action_catalog.py       atomic action compatibility catalog
 external/karmelita_practice/          BepInEx telemetry plugin
 tools/                                cold-start validation utilities
 test_curated_actions.py               curated-action regression tests
 ```
+
+`real_dqn.py` continues to re-export the moved public symbols so existing
+imports, tests, and checkpoint tooling remain compatible.

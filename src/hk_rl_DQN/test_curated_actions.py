@@ -7,6 +7,7 @@ import unittest
 
 import torch
 
+from . import real_actions, real_replay, real_reward
 from .final_project.action_executor import (
     BRANCH_SIZES,
     KeyboardActionExecutor,
@@ -19,10 +20,14 @@ from .real_dqn import (
     JOINT_ACTION_COUNT,
     EVADE_SUCCESS_REWARD,
     HARPOON_SUCCESS_BONUS_FRACTION,
+    BOSS_PROXIMITY_REWARD,
     ActionOutcomeTrial,
     JointDQN,
     LiveTrainer,
     PendingTransition,
+    ZERO_SPACE_ENTRY_PENALTY,
+    ZERO_SPACE_HOLD_PENALTY,
+    ZERO_SPACE_HURT_PENALTY,
     Transition,
     decode_joint_action,
     joint_action_id,
@@ -34,6 +39,12 @@ from .real_state import COLLISION_RISK_INDEX, STATE_DIMENSIONS, encode_snapshot
 
 
 class CuratedActionCatalogTests(unittest.TestCase):
+    def test_refactored_modules_own_public_components(self) -> None:
+        self.assertIs(JOINT_ACTIONS, real_actions.JOINT_ACTIONS)
+        self.assertIs(Transition, real_replay.Transition)
+        self.assertIs(PendingTransition, real_reward.PendingTransition)
+        self.assertIs(ActionOutcomeTrial, real_reward.ActionOutcomeTrial)
+
     def test_catalog_has_expected_shape_and_order(self) -> None:
         self.assertEqual(BRANCH_SIZES, (3, 6, 6))
         self.assertEqual(JOINT_ACTION_COUNT, 53)
@@ -218,6 +229,93 @@ class CuratedActionCatalogTests(unittest.TestCase):
             trainer.metrics.harpoon_evade_bonus_reward,
             EVADE_SUCCESS_REWARD * HARPOON_SUCCESS_BONUS_FRACTION,
         )
+
+    def test_zero_space_is_a_boss_centered_lower_half_ellipse(self) -> None:
+        def frame(player_x: float, player_y: float):
+            return encode_snapshot({
+                "player_grounded": False,
+                "player": {
+                    "x": player_x,
+                    "y": player_y,
+                    "velocity_x": 0.0,
+                    "velocity_y": 0.0,
+                },
+                "boss": {
+                    "x": 150.0,
+                    "y": 20.0,
+                    "velocity_x": 0.0,
+                    "velocity_y": 0.0,
+                },
+                "fsm": [],
+            })
+
+        self.assertTrue(LiveTrainer._inside_zero_space(frame(150.0, 20.0)))
+        self.assertTrue(LiveTrainer._inside_zero_space(frame(148.8, 20.0)))
+        self.assertTrue(LiveTrainer._inside_zero_space(frame(150.0, 18.4)))
+        self.assertFalse(LiveTrainer._inside_zero_space(frame(150.0, 20.01)))
+        self.assertFalse(LiveTrainer._inside_zero_space(frame(148.8, 18.4)))
+
+    def test_zero_space_entry_hold_and_hurt_credit_are_auditable(self) -> None:
+        recorder = ActionRecorder.__new__(ActionRecorder)
+        recorder.stream = io.StringIO()
+        recorder.sequence = 0
+        executor = KeyboardActionExecutor(recorder=recorder)
+        online = JointDQN()
+        trainer = LiveTrainer(
+            online,
+            JointDQN(),
+            torch.optim.AdamW(online.parameters()),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        masks = tuple(tuple(True for _ in range(size)) for size in BRANCH_SIZES)
+
+        def pending() -> PendingTransition:
+            return PendingTransition(
+                Transition(
+                    state=(0.0,) * STATE_DIMENSIONS,
+                    action=joint_action_id((0, 1, 1)),
+                    reward=0.0,
+                    next_state=(0.0,) * STATE_DIMENSIONS,
+                    done=False,
+                    next_action_mask=joint_action_mask(masks),
+                ),
+                created_step=0,
+            )
+
+        state = encode_snapshot({
+            "player_grounded": True,
+            "player": {"x": 150.0, "y": 19.5, "velocity_x": 0.0, "velocity_y": 0.0},
+            "boss": {"x": 150.0, "y": 20.0, "velocity_x": 0.0, "velocity_y": 0.0},
+            "fsm": [],
+        })
+        trainer.proximity_reward_balance = BOSS_PROXIMITY_REWARD
+        first = pending()
+        trainer._apply_zero_space_shaping(state, first)
+        self.assertAlmostEqual(
+            first.delayed_reward,
+            ZERO_SPACE_ENTRY_PENALTY - BOSS_PROXIMITY_REWARD,
+        )
+        second = pending()
+        trainer._apply_zero_space_shaping(state, second)
+        self.assertAlmostEqual(second.delayed_reward, ZERO_SPACE_HOLD_PENALTY)
+
+        trainer._credit_offensive_reward(second, 2.0)
+        trainer.pending_credit_transitions.append(second)
+        trainer._apply_zero_space_hurt_credit(
+            SimpleNamespace(player_damage_taken=1)
+        )
+        self.assertAlmostEqual(
+            second.delayed_reward,
+            ZERO_SPACE_HOLD_PENALTY + ZERO_SPACE_HURT_PENALTY,
+        )
+        trainer._credit_offensive_reward(second, 1.0)
+        self.assertAlmostEqual(
+            second.delayed_reward,
+            ZERO_SPACE_HOLD_PENALTY + ZERO_SPACE_HURT_PENALTY,
+        )
+        self.assertAlmostEqual(trainer.metrics.zero_space_offensive_clawback, -3.0)
 
     def test_network_outputs_one_value_per_curated_action(self) -> None:
         output = JointDQN()(torch.zeros((2, STATE_DIMENSIONS)))

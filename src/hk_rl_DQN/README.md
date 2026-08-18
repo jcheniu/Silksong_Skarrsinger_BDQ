@@ -12,13 +12,19 @@ The live pipeline is split by responsibility:
   10 motion values, normalized silk, seven compressed Boss semantics, and six
   previous-action/control values. Player health is deliberately absent from
   the observation for one-hit training, while health loss still drives reward.
-- `real_reward.py`: event reward calculation. Confirmed hit events are derived
+- `real_actions.py`: curated 53-action catalog, legality masks, attack-range
+  geometry, temporal action coordination, and exploration/action selection.
+- `real_replay.py`: immutable transitions, replay storage, and left/right
+  mirror augmentation.
+- `real_reward.py`: immediate rewards, delayed event attribution, pending
+  credit windows, and episode reward metrics. Confirmed hit events are derived
   from a decrease in the game's Boss `HealthManager.hp`, but raw Boss HP is
   never exposed to the DQN observation.
 - `final_project/action_executor.py`: three coordinated action fields,
-  legality masks, held-key timing, and JSONL action records.
-- `real_dqn.py`: 53-action Dueling Double DQN, replay, checkpoints, and the
-  telemetry training loop.
+  held-key timing, keyboard execution, and JSONL action records.
+- `real_dqn.py`: neural network, optimizer, checkpoints, trainer orchestration,
+  telemetry loop, and CLI. It re-exports the moved public names for backward
+  compatibility.
 - `tools/`: explicit cold-start state/action acceptance tests.
 
 The fixed action vector is `[3,6,6]` in this order: `jump_z, movement, combat`.
@@ -91,7 +97,7 @@ ability-disable state, harpoon availability, and quick-cast availability.
 `spell_shift` is masked when silk is insufficient or the action is unavailable.
 
 The current reward protocol is
-`normalized-evade-budget-v24-harpoon-bonus-curated-53`.
+`normalized-evade-budget-v25-zero-space-curated-53`.
 Replay training starts at 2,000 transitions. Epsilon is driven by training
 transitions using a mild reciprocal curve from `0.60` to `0.05` across 600,000
 transitions. This keeps materially more exploration after the early policy has
@@ -144,15 +150,22 @@ directional movement confined to 10% of arena width for about one second adds
 while walking or dashing adds up to `-0.25`. Entering the large outer
 Boss-proximity zone gives `+0.05` once,
 then locks until confirmed Boss damage refreshes it and the player leaves and
-re-enters. The outermost 12% at either arena boundary costs `-0.1` every tick.
+re-enters. Zero space is the lower half of a Boss-centered ellipse with
+horizontal radius `1.2` and downward radius `1.6`; every point above the Boss
+is excluded. Entry costs `-0.5`, later 50 ms ticks cost `-0.025`, and damage
+taken within 400 ms adds one `-0.75` attribution budget. Entry also claws back
+an outstanding `+0.05` proximity reward. Boss-damage rewards credited to those
+zero-space transitions are clawed back at 100% after the attributed hit,
+including rewards that arrive later. The outermost 12% at either arena boundary
+costs `-0.1` every tick.
 Silk consumption costs `-0.04` per unit.
 The 24-value observation now gives `spin_attack` and `cyclone` distinct attack
 category values and replaces the coarse displacement flag with continuous
 collision risk. Training batches randomly mirror half their transitions across
 the arena center, including actions and legality masks, so left/right examples
 teach the corresponding reflected behavior. Use `--reset` because checkpoint
-version 31 changes state, timing, exploration, and reward semantics; version 30
-checkpoints and replay must not be reused.
+version 32 adds zero-space reward attribution; version 31 checkpoints and replay
+must not be reused.
 
 X charge is valid for a release window rather than one fixed duration. It
 becomes complete at 1,350 ms. With a 50 ms control tick, the first practical
