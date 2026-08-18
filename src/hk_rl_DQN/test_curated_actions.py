@@ -45,6 +45,43 @@ class CuratedActionCatalogTests(unittest.TestCase):
         self.assertIs(PendingTransition, real_reward.PendingTransition)
         self.assertIs(ActionOutcomeTrial, real_reward.ActionOutcomeTrial)
 
+    def test_live_observe_records_player_position_after_refactor(self) -> None:
+        recorder = ActionRecorder.__new__(ActionRecorder)
+        recorder.stream = io.StringIO()
+        recorder.sequence = 0
+        executor = KeyboardActionExecutor(recorder=recorder)
+        online = JointDQN()
+        trainer = LiveTrainer(
+            online,
+            JointDQN(),
+            torch.optim.AdamW(online.parameters()),
+            executor,
+            torch.device("cpu"),
+            random.Random(1),
+        )
+        snapshot = {
+            "timestamp": 1.0,
+            "player_grounded": True,
+            "player": {
+                "x": 150.0,
+                "y": 20.0,
+                "velocity_x": 0.0,
+                "velocity_y": 0.0,
+            },
+            "boss": {
+                "x": 160.0,
+                "y": 20.0,
+                "velocity_x": 0.0,
+                "velocity_y": 0.0,
+            },
+            "fsm": [],
+        }
+
+        trainer.observe(snapshot)
+
+        self.assertEqual(tuple(trainer.current_macro_positions), (150.0,))
+        self.assertIsNotNone(trainer.previous_action)
+
     def test_catalog_has_expected_shape_and_order(self) -> None:
         self.assertEqual(BRANCH_SIZES, (3, 6, 6))
         self.assertEqual(JOINT_ACTION_COUNT, 53)

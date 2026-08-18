@@ -51,6 +51,7 @@ from .real_actions import (
     danger_requires_commitment_break,
     decode_joint_action,
     epsilon_for_transition,
+    _entity_value,
     joint_action_id,
     joint_action_mask,
     select_action,
